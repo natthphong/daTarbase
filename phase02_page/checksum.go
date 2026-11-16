@@ -1,6 +1,8 @@
 package page
 
 import (
+	"fmt"
+
 	"github.com/natthphong/daTarbase/pkg/types"
 )
 
@@ -37,7 +39,16 @@ import (
 // Constraints: O(PageSize), no allocation (hash/fnv is allowed but needs care with rule 1).
 // Postgres reference: pg_checksum_page() in src/include/storage/checksum_impl.h
 func (p *Page) ComputeChecksum(id types.PageID) uint16 {
-	panic("TODO: Problem 2.11")
+	h := uint32(2166136261)
+	for i, b := range p.buf {
+		if i == 6 || i == 7 {
+			b = 0
+		}
+		h ^= uint32(b)
+		h *= 16777619
+	}
+	h ^= uint32(id)
+	return uint16(h%65535) + 1
 }
 
 // Problem 2.12 — VerifyChecksum [Easy]
@@ -65,7 +76,11 @@ func (p *Page) ComputeChecksum(id types.PageID) uint16 {
 // Constraints: O(PageSize).
 // Postgres reference: PageIsVerifiedExtended() in src/backend/storage/page/bufpage.c
 func (p *Page) VerifyChecksum(id types.PageID) error {
-	panic("TODO: Problem 2.12")
+	stored, computed := p.StoredChecksum(), p.ComputeChecksum(id)
+	if stored != computed {
+		return fmt.Errorf("%w: block %d: stored %d, computed %d", ErrChecksumMismatch, id, stored, computed)
+	}
+	return nil
 }
 
 // Problem 2.13 — Serialize [Easy]
@@ -92,7 +107,11 @@ func (p *Page) VerifyChecksum(id types.PageID) error {
 // Constraints: exactly one PageSize allocation.
 // Postgres reference: PageSetChecksumCopy() in src/backend/storage/page/bufpage.c
 func (p *Page) Serialize(id types.PageID) []byte {
-	panic("TODO: Problem 2.13")
+	out := make([]byte, PageSize)
+	copy(out, p.buf[:])
+	sum := p.ComputeChecksum(id)
+	out[6], out[7] = byte(sum), byte(sum>>8)
+	return out
 }
 
 // Problem 2.14 — Load [Medium]
@@ -133,5 +152,40 @@ func (p *Page) Serialize(id types.PageID) []byte {
 // Constraints: O(PageSize).
 // Postgres reference: PageIsVerifiedExtended() and PageHeaderIsValid in src/backend/storage/page/bufpage.c
 func Load(b []byte, id types.PageID) (*Page, error) {
-	panic("TODO: Problem 2.14")
+	if len(b) != PageSize {
+		return nil, fmt.Errorf("%w: image is %d bytes, want %d", ErrCorruptPage, len(b), PageSize)
+	}
+	allZero := true
+	for _, c := range b {
+		if c != 0 {
+			allZero = false
+			break
+		}
+	}
+	if allZero {
+		return NewPage(), nil
+	}
+	p := &Page{}
+	copy(p.buf[:], b)
+	if err := p.VerifyChecksum(id); err != nil {
+		return nil, err
+	}
+	lower, upper := int(p.Lower()), int(p.Upper())
+	if lower < HeaderSize || lower > upper || upper > PageSize || (lower-HeaderSize)%LinePointerLen != 0 || p.Flags() != 0 {
+		return nil, fmt.Errorf("%w: bad header lower=%d upper=%d flags=%#x", ErrCorruptPage, lower, upper, p.Flags())
+	}
+	for s := 0; s < p.NumSlots(); s++ {
+		it, _ := p.ItemID(SlotID(s))
+		ok := false
+		switch it.Flags {
+		case LPUnused:
+			ok = it.Off == 0 && it.Len == 0
+		case LPNormal, LPDead:
+			ok = it.Len >= 1 && int(it.Off) >= upper && int(it.Off)+int(it.Len) <= PageSize
+		}
+		if !ok {
+			return nil, fmt.Errorf("%w: slot %d: bad line pointer %+v", ErrCorruptPage, s, it)
+		}
+	}
+	return p, nil
 }

@@ -49,5 +49,24 @@ import "github.com/natthphong/daTarbase/pkg/types"
 // Constraints: no busy waiting; must pass -race.
 // Postgres reference: XLogFlush() in src/backend/access/transam/xlog.c (WALWriteLock + re-check of LogwrtResult)
 func (l *Log) FlushUpTo(lsn types.LSN) {
-	panic("TODO: Problem 10.5")
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for {
+		end := types.LSN(len(l.buf))
+		if l.flushed > lsn || l.flushed == end {
+			return
+		}
+		if l.flushing {
+			l.cond.Wait()
+			continue
+		}
+		l.flushing = true
+		from, data := l.flushed, l.buf[l.flushed:end]
+		l.mu.Unlock()
+		l.fsync(from, data)
+		l.mu.Lock()
+		l.flushed = end
+		l.flushing = false
+		l.cond.Broadcast()
+	}
 }

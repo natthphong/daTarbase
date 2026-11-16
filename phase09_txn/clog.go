@@ -113,7 +113,22 @@ func (c *Clog) Page(n uint32) []byte { return c.Pages[n] }
 // Constraints: O(1); allocate at most one page.
 // Postgres reference: TransactionIdSetStatusBit() in src/backend/access/transam/clog.c
 func (c *Clog) Set(xid types.TxnID, status TxnStatus) error {
-	panic("TODO: Problem 9.1")
+	if status > StatusSubCommitted {
+		return ErrBadStatus
+	}
+	if !IsNormal(xid) {
+		return ErrSpecialXid
+	}
+	pageNo := uint32(xid) / ClogXactsPerPage
+	page := c.Pages[pageNo]
+	if page == nil {
+		page = make([]byte, ClogPageSize)
+		c.Pages[pageNo] = page
+	}
+	idx := (uint32(xid) % ClogXactsPerPage) / ClogXactsPerByte
+	shift := (uint32(xid) % ClogXactsPerByte) * ClogBitsPerXact
+	page[idx] = page[idx]&^(0b11<<shift) | byte(status)<<shift
+	return nil
 }
 
 // Problem 9.2 — ClogGet [Easy]
@@ -140,7 +155,19 @@ func (c *Clog) Set(xid types.TxnID, status TxnStatus) error {
 // Constraints: O(1), no allocation.
 // Postgres reference: TransactionIdGetStatus() in clog.c, TransactionLogFetch() in transam.c
 func (c *Clog) Get(xid types.TxnID) TxnStatus {
-	panic("TODO: Problem 9.2")
+	switch xid {
+	case types.InvalidTxnID:
+		return StatusAborted
+	case BootstrapTxnID, FrozenTxnID:
+		return StatusCommitted
+	}
+	page := c.Pages[uint32(xid)/ClogXactsPerPage]
+	if page == nil {
+		return StatusInProgress
+	}
+	idx := (uint32(xid) % ClogXactsPerPage) / ClogXactsPerByte
+	shift := (uint32(xid) % ClogXactsPerByte) * ClogBitsPerXact
+	return TxnStatus(page[idx] >> shift & 0b11)
 }
 
 // Problem 9.3 — TxnIDPrecedes [Easy]
@@ -177,5 +204,8 @@ func (c *Clog) Get(xid types.TxnID) TxnStatus {
 // Constraints: O(1).
 // Postgres reference: TransactionIdPrecedes() in src/backend/access/transam/transam.c
 func TxnIDPrecedes(a, b types.TxnID) bool {
-	panic("TODO: Problem 9.3")
+	if !IsNormal(a) || !IsNormal(b) {
+		return a < b
+	}
+	return int32(uint32(a)-uint32(b)) < 0
 }

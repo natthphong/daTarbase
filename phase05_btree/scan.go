@@ -1,6 +1,8 @@
 package btree
 
 import (
+	"bytes"
+
 	"github.com/natthphong/daTarbase/pkg/types"
 )
 
@@ -49,7 +51,83 @@ import (
 // Constraints: reads = Height + leaves moved to. No writes. No allocation per entry.
 // Postgres reference: _bt_first() / _bt_next() / _bt_steppage() in src/backend/access/nbtree/nbtsearch.c
 func (c *Cursor) Next() (Item, bool) {
-	panic("TODO: Problem 5.12")
+	if c.done {
+		return Item{}, false
+	}
+	t := c.tree
+	if !c.started {
+		c.started = true
+		switch {
+		case !c.desc:
+			probe := Item{}
+			if !c.lo.Unbounded {
+				probe.Key, probe.TID = c.lo.Key, MinTID
+				if !c.lo.Inclusive {
+					probe.TID = MaxTID
+				}
+			}
+			path := t.Descend(probe)
+			s := path[len(path)-1]
+			c.leaf, c.pos = s.Node, s.Pos
+		case c.hi.Unbounded:
+			n := t.Store.Get(t.Root)
+			for !n.Leaf {
+				n = t.Store.Get(n.Children[len(n.Children)-1])
+			}
+			c.leaf, c.pos = n, len(n.Items)-1
+		default:
+			probe := Item{Key: c.hi.Key, TID: MinTID}
+			if c.hi.Inclusive {
+				probe.TID = MaxTID
+			}
+			path := t.Descend(probe)
+			s := path[len(path)-1]
+			c.leaf, c.pos = s.Node, s.Pos-1
+		}
+	}
+	for {
+		if !c.desc && c.pos >= len(c.leaf.Items) {
+			if c.leaf.Next == types.InvalidPageID {
+				c.done = true
+				return Item{}, false
+			}
+			c.leaf, c.pos = t.Store.Get(c.leaf.Next), 0
+			continue
+		}
+		if c.desc && c.pos < 0 {
+			if c.leaf.Prev == types.InvalidPageID {
+				c.done = true
+				return Item{}, false
+			}
+			c.leaf = t.Store.Get(c.leaf.Prev)
+			c.pos = len(c.leaf.Items) - 1
+			continue
+		}
+		it := c.leaf.Items[c.pos]
+		if c.desc {
+			c.pos--
+		} else {
+			c.pos++
+		}
+		belowLo := false
+		if !c.lo.Unbounded {
+			cmp := bytes.Compare(it.Key, c.lo.Key)
+			belowLo = cmp < 0 || (cmp == 0 && !c.lo.Inclusive)
+		}
+		aboveHi := false
+		if !c.hi.Unbounded {
+			cmp := bytes.Compare(it.Key, c.hi.Key)
+			aboveHi = cmp > 0 || (cmp == 0 && !c.hi.Inclusive)
+		}
+		if (!c.desc && aboveHi) || (c.desc && belowLo) {
+			c.done = true
+			return Item{}, false
+		}
+		if belowLo || aboveHi {
+			continue
+		}
+		return it, true
+	}
 }
 
 // Problem 5.13 — Prefix [Medium]
@@ -81,7 +159,15 @@ func (c *Cursor) Next() (Item, bool) {
 // Postgres reference: prefix LIKE becomes a range qual in
 // src/backend/utils/adt/like_support.c (make_greater_string).
 func (t *Tree) Prefix(prefix []byte) *Cursor {
-	panic("TODO: Problem 5.13")
+	end := bytes.Clone(prefix)
+	for len(end) > 0 && end[len(end)-1] == 0xFF {
+		end = end[:len(end)-1]
+	}
+	if len(end) == 0 {
+		return t.Scan(Incl(prefix), NoBound(), false)
+	}
+	end[len(end)-1]++
+	return t.Scan(Incl(prefix), Excl(end), false)
 }
 
 // Problem 5.14 — IndexOnlyScan [Easy]
@@ -112,5 +198,20 @@ func (t *Tree) Prefix(prefix []byte) *Cursor {
 // Constraints: one pass over the range.
 // Postgres reference: IndexOnlyNext() in src/backend/executor/nodeIndexonlyscan.c
 func (t *Tree) IndexOnlyScan(lo, hi Bound, allVisible func(types.PageID) bool, heapVisible func(types.TID) bool) ([]Item, int) {
-	panic("TODO: Problem 5.14")
+	var out []Item
+	fetches := 0
+	c := t.Scan(lo, hi, false)
+	for {
+		it, ok := c.Next()
+		if !ok {
+			return out, fetches
+		}
+		if !allVisible(it.TID.Page) {
+			fetches++
+			if !heapVisible(it.TID) {
+				continue
+			}
+		}
+		out = append(out, it)
+	}
 }

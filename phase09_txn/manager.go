@@ -2,6 +2,7 @@ package txn
 
 import (
 	"errors"
+	"slices"
 
 	"github.com/natthphong/daTarbase/pkg/types"
 )
@@ -81,7 +82,14 @@ func (m *TxnManager) Abort(xid types.TxnID) error { return m.End(xid, false) }
 // Constraints: O(1).
 // Postgres reference: GetNewTransactionId() in src/backend/access/transam/varsup.c
 func (m *TxnManager) Begin() types.TxnID {
-	panic("TODO: Problem 9.4")
+	xid := m.NextXid
+	m.NextXid++
+	if m.NextXid < FirstNormalTxnID {
+		m.NextXid = FirstNormalTxnID
+	}
+	m.Running[xid] = true
+	_ = m.Clog.Set(xid, StatusInProgress)
+	return xid
 }
 
 // Problem 9.5 — TxnManager.End [Easy]
@@ -115,7 +123,23 @@ func (m *TxnManager) Begin() types.TxnID {
 // Postgres reference: RecordTransactionCommit() / RecordTransactionAbort() in xact.c,
 // TransactionIdCommitTree() in transam.c
 func (m *TxnManager) End(xid types.TxnID, commit bool) error {
-	panic("TODO: Problem 9.5")
+	if !m.Running[xid] {
+		return ErrNotInProgress
+	}
+	if _, isSub := m.Parent[xid]; isSub {
+		return ErrSubxact
+	}
+	status := StatusAborted
+	if commit {
+		status = StatusCommitted
+	}
+	for x := range m.Running {
+		if m.TopLevel(x) == xid {
+			_ = m.Clog.Set(x, status)
+			delete(m.Running, x)
+		}
+	}
+	return nil
 }
 
 // CommandID numbers the statements inside one transaction (Postgres: CommandId,
@@ -167,7 +191,26 @@ type Snapshot struct {
 // Constraints: O(n log n) in the number of running xids.
 // Postgres reference: GetSnapshotData() in src/backend/storage/ipc/procarray.c
 func (m *TxnManager) GetSnapshot(myXid types.TxnID) *Snapshot {
-	panic("TODO: Problem 9.6")
+	s := &Snapshot{Xmin: m.NextXid, Xmax: m.NextXid, Xip: []types.TxnID{}}
+	for x := range m.Running {
+		if TxnIDPrecedes(x, s.Xmin) {
+			s.Xmin = x
+		}
+		if myXid != types.InvalidTxnID && m.TopLevel(x) == myXid {
+			continue
+		}
+		s.Xip = append(s.Xip, x)
+	}
+	slices.SortFunc(s.Xip, func(a, b types.TxnID) int {
+		switch {
+		case a == b:
+			return 0
+		case TxnIDPrecedes(a, b):
+			return -1
+		}
+		return 1
+	})
+	return s
 }
 
 // Problem 9.7 — XidInSnapshot [Medium]
@@ -189,5 +232,26 @@ func (m *TxnManager) GetSnapshot(myXid types.TxnID) *Snapshot {
 // Constraints: O(log |Xip|) — Xip is sorted, use binary search.
 // Postgres reference: XidInMVCCSnapshot() in src/backend/utils/time/snapmgr.c
 func XidInSnapshot(xid types.TxnID, snap *Snapshot) bool {
-	panic("TODO: Problem 9.7")
+	if !IsNormal(xid) {
+		return false
+	}
+	if TxnIDPrecedes(xid, snap.Xmin) {
+		return false
+	}
+	if !TxnIDPrecedes(xid, snap.Xmax) {
+		return true
+	}
+	lo, hi := 0, len(snap.Xip)
+	for lo < hi {
+		mid := (lo + hi) / 2
+		switch {
+		case snap.Xip[mid] == xid:
+			return true
+		case TxnIDPrecedes(snap.Xip[mid], xid):
+			lo = mid + 1
+		default:
+			hi = mid
+		}
+	}
+	return false
 }

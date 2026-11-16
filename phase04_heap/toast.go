@@ -1,6 +1,8 @@
 package heap
 
 import (
+	"encoding/binary"
+
 	"github.com/natthphong/daTarbase/pkg/types"
 )
 
@@ -77,7 +79,28 @@ func NewToaster() *Toaster {
 // Postgres reference: toast_save_datum() in src/backend/access/common/toast_internals.c,
 // struct varatt_external in src/include/varatt.h
 func (t *Toaster) Toast(value []byte) ([]byte, error) {
-	panic("TODO: Problem 4.13")
+	if len(value) <= ToastThreshold {
+		return append([]byte{ToastTagInline}, value...), nil
+	}
+	id := t.NextValueID
+	t.NextValueID++
+	for seq, off := 0, 0; off < len(value); seq, off = seq+1, off+ToastChunkSize {
+		end := min(off+ToastChunkSize, len(value))
+		chunk := make([]byte, ToastChunkHeader, ToastChunkHeader+end-off)
+		binary.LittleEndian.PutUint32(chunk[0:4], id)
+		binary.LittleEndian.PutUint32(chunk[4:8], uint32(seq))
+		chunk = append(chunk, value[off:end]...)
+		tid, err := t.Rel.Insert(chunk)
+		if err != nil {
+			return nil, err
+		}
+		t.Index[id] = append(t.Index[id], tid)
+	}
+	ptr := make([]byte, ToastPointerSize)
+	ptr[0] = ToastTagExternal
+	binary.LittleEndian.PutUint32(ptr[1:5], id)
+	binary.LittleEndian.PutUint32(ptr[5:9], uint32(len(value)))
+	return ptr, nil
 }
 
 // Problem 4.14 — Detoast [Medium]
@@ -110,5 +133,37 @@ func (t *Toaster) Toast(value []byte) ([]byte, error) {
 // Postgres reference: detoast_external_attr() / toast_fetch_datum() in
 // src/backend/access/common/detoast.c
 func (t *Toaster) Detoast(stored []byte) ([]byte, error) {
-	panic("TODO: Problem 4.14")
+	if len(stored) == 0 {
+		return nil, ErrCorruptToast
+	}
+	switch stored[0] {
+	case ToastTagInline:
+		return append([]byte{}, stored[1:]...), nil
+	case ToastTagExternal:
+	default:
+		return nil, ErrCorruptToast
+	}
+	if len(stored) != ToastPointerSize {
+		return nil, ErrCorruptToast
+	}
+	id := binary.LittleEndian.Uint32(stored[1:5])
+	raw := int(binary.LittleEndian.Uint32(stored[5:9]))
+	tids, ok := t.Index[id]
+	if !ok {
+		return nil, ErrCorruptToast
+	}
+	out := make([]byte, 0, min(raw, len(tids)*ToastChunkSize))
+	for i, tid := range tids {
+		data, _, err := t.Rel.Fetch(tid)
+		if err != nil || len(data) < ToastChunkHeader ||
+			binary.LittleEndian.Uint32(data[0:4]) != id ||
+			binary.LittleEndian.Uint32(data[4:8]) != uint32(i) {
+			return nil, ErrCorruptToast
+		}
+		out = append(out, data[ToastChunkHeader:]...)
+	}
+	if len(out) != raw {
+		return nil, ErrCorruptToast
+	}
+	return out, nil
 }

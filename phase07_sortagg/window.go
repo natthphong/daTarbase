@@ -1,6 +1,8 @@
 package sortagg
 
 import (
+	"slices"
+
 	"github.com/natthphong/daTarbase/pkg/exec"
 	"github.com/natthphong/daTarbase/pkg/types"
 )
@@ -75,5 +77,102 @@ type WindowSpec struct {
 // Postgres reference: ExecWindowAgg() in src/backend/executor/nodeWindowAgg.c,
 // window_rank() / window_dense_rank() in src/backend/utils/adt/windowfuncs.c
 func Window(child exec.Iterator, spec WindowSpec, funcs []WinFunc) (out []types.Row, err error) {
-	panic("TODO: Problem 7.15")
+	if err := child.Open(); err != nil {
+		return nil, err
+	}
+	var rows []types.Row
+	for {
+		r, ok, err := child.Next()
+		if err != nil {
+			child.Close()
+			return nil, err
+		}
+		if !ok {
+			break
+		}
+		rows = append(rows, r)
+	}
+	if err := child.Close(); err != nil {
+		return nil, err
+	}
+	var keys []SortKey
+	for _, c := range spec.PartitionBy {
+		keys = append(keys, Asc(c))
+	}
+	keys = append(keys, spec.OrderBy...)
+	slices.SortStableFunc(rows, func(a, b types.Row) int { return CompareRows(a, b, keys) })
+
+	samePart := func(a, b types.Row) bool {
+		for _, c := range spec.PartitionBy {
+			if !types.Identical(a[c], b[c]) {
+				return false
+			}
+		}
+		return true
+	}
+	type sum struct {
+		i, n     int64
+		f        float64
+		sawFloat bool
+	}
+	for ps := 0; ps < len(rows); {
+		pe := ps + 1
+		for pe < len(rows) && samePart(rows[ps], rows[pe]) {
+			pe++
+		}
+		sums := make([]sum, len(funcs))
+		dense := int64(0)
+		for gs := ps; gs < pe; {
+			ge := gs + 1
+			for ge < pe && CompareRows(rows[gs], rows[ge], spec.OrderBy) == 0 {
+				ge++
+			}
+			dense++
+			for i, f := range funcs {
+				if f.Kind != WinSum {
+					continue
+				}
+				for _, r := range rows[gs:ge] {
+					v := r[f.Col]
+					switch {
+					case v.IsNull():
+						continue
+					case v.Kind == types.KindFloat64:
+						sums[i].f += v.F
+						sums[i].sawFloat = true
+					default:
+						sums[i].i += v.I
+					}
+					sums[i].n++
+				}
+			}
+			for k := gs; k < ge; k++ {
+				o := append(make(types.Row, 0, len(rows[k])+len(funcs)), rows[k]...)
+				for i, f := range funcs {
+					switch f.Kind {
+					case WinRowNumber:
+						o = append(o, types.Int64(int64(k-ps+1)))
+					case WinRank:
+						o = append(o, types.Int64(int64(gs-ps+1)))
+					case WinDenseRank:
+						o = append(o, types.Int64(dense))
+					case WinSum:
+						s := sums[i]
+						switch {
+						case s.n == 0:
+							o = append(o, types.Null())
+						case s.sawFloat:
+							o = append(o, types.Float64(float64(s.i)+s.f))
+						default:
+							o = append(o, types.Int64(s.i))
+						}
+					}
+				}
+				out = append(out, o)
+			}
+			gs = ge
+		}
+		ps = pe
+	}
+	return out, nil
 }

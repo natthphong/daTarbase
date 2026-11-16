@@ -1,6 +1,8 @@
 package executor
 
 import (
+	"math"
+
 	"github.com/natthphong/daTarbase/pkg/types"
 )
 
@@ -58,5 +60,235 @@ import (
 // Postgres reference: ExecInterpExpr() in src/backend/executor/execExprInterp.c,
 // int4pl()/int4div() in src/backend/utils/adt/int.c.
 func Eval(e Expr, row types.Row) (types.Value, error) {
-	panic("TODO: Problem 6.1")
+	isNum := func(v types.Value) bool {
+		return v.Kind == types.KindInt32 || v.Kind == types.KindInt64 || v.Kind == types.KindFloat64
+	}
+	comparable := func(a, b types.Value) bool {
+		return (isNum(a) && isNum(b)) || (a.Kind == b.Kind && (a.Kind == types.KindText || a.Kind == types.KindBool))
+	}
+	// asBool returns 0=false, 1=true, 2=null.
+	asBool := func(v types.Value) (int, error) {
+		switch v.Kind {
+		case types.KindNull:
+			return 2, nil
+		case types.KindBool:
+			if v.B {
+				return 1, nil
+			}
+			return 0, nil
+		}
+		return 0, ErrTypeMismatch
+	}
+
+	switch n := e.(type) {
+	case Const:
+		return n.Val, nil
+	case ColRef:
+		if n.Index < 0 || n.Index >= len(row) {
+			return types.Value{}, ErrBadColumn
+		}
+		return row[n.Index], nil
+	case Compare:
+		l, err := Eval(n.L, row)
+		if err != nil {
+			return types.Value{}, err
+		}
+		r, err := Eval(n.R, row)
+		if err != nil {
+			return types.Value{}, err
+		}
+		if l.IsNull() || r.IsNull() {
+			return types.Null(), nil
+		}
+		if !comparable(l, r) {
+			return types.Value{}, ErrTypeMismatch
+		}
+		c := types.Compare(l, r)
+		var b bool
+		switch n.Op {
+		case OpLT:
+			b = c < 0
+		case OpLE:
+			b = c <= 0
+		case OpEQ:
+			b = c == 0
+		case OpNE:
+			b = c != 0
+		case OpGT:
+			b = c > 0
+		case OpGE:
+			b = c >= 0
+		default:
+			return types.Value{}, ErrBadExpr
+		}
+		return types.Bool(b), nil
+	case And, Or:
+		var le, re Expr
+		isAnd := false
+		if a, ok := n.(And); ok {
+			le, re, isAnd = a.L, a.R, true
+		} else {
+			o := n.(Or)
+			le, re = o.L, o.R
+		}
+		lv, err := Eval(le, row)
+		if err != nil {
+			return types.Value{}, err
+		}
+		l, err := asBool(lv)
+		if err != nil {
+			return types.Value{}, err
+		}
+		decider := 0 // FALSE decides AND
+		if !isAnd {
+			decider = 1 // TRUE decides OR
+		}
+		if l == decider {
+			return types.Bool(decider == 1), nil
+		}
+		rv, err := Eval(re, row)
+		if err != nil {
+			return types.Value{}, err
+		}
+		r, err := asBool(rv)
+		if err != nil {
+			return types.Value{}, err
+		}
+		if r == decider {
+			return types.Bool(decider == 1), nil
+		}
+		if l == 2 || r == 2 {
+			return types.Null(), nil
+		}
+		return types.Bool(decider == 0), nil
+	case Not:
+		v, err := Eval(n.X, row)
+		if err != nil {
+			return types.Value{}, err
+		}
+		b, err := asBool(v)
+		if err != nil {
+			return types.Value{}, err
+		}
+		if b == 2 {
+			return types.Null(), nil
+		}
+		return types.Bool(b == 0), nil
+	case IsNull:
+		v, err := Eval(n.X, row)
+		if err != nil {
+			return types.Value{}, err
+		}
+		return types.Bool(v.IsNull()), nil
+	case IsNotNull:
+		v, err := Eval(n.X, row)
+		if err != nil {
+			return types.Value{}, err
+		}
+		return types.Bool(!v.IsNull()), nil
+	case Arith:
+		l, err := Eval(n.L, row)
+		if err != nil {
+			return types.Value{}, err
+		}
+		r, err := Eval(n.R, row)
+		if err != nil {
+			return types.Value{}, err
+		}
+		if l.IsNull() || r.IsNull() {
+			return types.Null(), nil
+		}
+		if !isNum(l) || !isNum(r) {
+			return types.Value{}, ErrTypeMismatch
+		}
+		if l.Kind == types.KindFloat64 || r.Kind == types.KindFloat64 {
+			lf, rf := l.F, r.F
+			if l.Kind != types.KindFloat64 {
+				lf = float64(l.I)
+			}
+			if r.Kind != types.KindFloat64 {
+				rf = float64(r.I)
+			}
+			switch n.Op {
+			case OpAdd:
+				return types.Float64(lf + rf), nil
+			case OpSub:
+				return types.Float64(lf - rf), nil
+			case OpMul:
+				return types.Float64(lf * rf), nil
+			case OpDiv:
+				if rf == 0 {
+					return types.Value{}, ErrDivisionByZero
+				}
+				return types.Float64(lf / rf), nil
+			}
+			return types.Value{}, ErrBadExpr
+		}
+		a, b := l.I, r.I
+		var res int64
+		switch n.Op {
+		case OpAdd:
+			res = a + b
+			if (b > 0 && res < a) || (b < 0 && res > a) {
+				return types.Value{}, ErrIntegerOverflow
+			}
+		case OpSub:
+			res = a - b
+			if (b < 0 && res < a) || (b > 0 && res > a) {
+				return types.Value{}, ErrIntegerOverflow
+			}
+		case OpMul:
+			res = a * b
+			if a != 0 && (res/a != b || (a == -1 && b == math.MinInt64) || (b == -1 && a == math.MinInt64)) {
+				return types.Value{}, ErrIntegerOverflow
+			}
+		case OpDiv:
+			if b == 0 {
+				return types.Value{}, ErrDivisionByZero
+			}
+			if a == math.MinInt64 && b == -1 {
+				return types.Value{}, ErrIntegerOverflow
+			}
+			res = a / b
+		default:
+			return types.Value{}, ErrBadExpr
+		}
+		if l.Kind == types.KindInt64 || r.Kind == types.KindInt64 {
+			return types.Int64(res), nil
+		}
+		if res < math.MinInt32 || res > math.MaxInt32 {
+			return types.Value{}, ErrIntegerOverflow
+		}
+		return types.Int32(int32(res)), nil
+	case In:
+		x, err := Eval(n.X, row)
+		if err != nil {
+			return types.Value{}, err
+		}
+		if x.IsNull() {
+			return types.Null(), nil
+		}
+		sawNull := false
+		for _, item := range n.List {
+			v, err := Eval(item, row)
+			if err != nil {
+				return types.Value{}, err
+			}
+			if v.IsNull() {
+				sawNull = true
+				continue
+			}
+			if !comparable(x, v) {
+				return types.Value{}, ErrTypeMismatch
+			}
+			if types.Compare(x, v) == 0 {
+				return types.Bool(true), nil
+			}
+		}
+		if sawNull {
+			return types.Null(), nil
+		}
+		return types.Bool(false), nil
+	}
+	return types.Value{}, ErrBadExpr
 }

@@ -41,7 +41,26 @@ func (f *Filter) Close() error { return f.Child.Close() }
 // Constraints: do not buffer rows; pull exactly as many as needed.
 // Postgres reference: ExecQual() in src/include/executor/executor.h, ExecScan() in execScan.c
 func (f *Filter) Next() (types.Row, bool, error) {
-	panic("TODO: Problem 6.2")
+	for {
+		row, ok, err := f.Child.Next()
+		if err != nil || !ok {
+			return nil, ok, err
+		}
+		v, err := Eval(f.Pred, row)
+		if err != nil {
+			return nil, false, err
+		}
+		switch v.Kind {
+		case types.KindBool:
+			if v.B {
+				return row, true, nil
+			}
+		case types.KindNull:
+		default:
+			return nil, false, ErrTypeMismatch
+		}
+		f.RowsRemoved++
+	}
 }
 
 // Project computes a new row from each child row: the SELECT list
@@ -74,7 +93,19 @@ func (p *Project) Close() error { return p.Child.Close() }
 // Constraints: one child row per output row.
 // Postgres reference: ExecProject() in src/include/executor/executor.h
 func (p *Project) Next() (types.Row, bool, error) {
-	panic("TODO: Problem 6.3")
+	in, ok, err := p.Child.Next()
+	if err != nil || !ok {
+		return nil, ok, err
+	}
+	out := make(types.Row, len(p.Exprs))
+	for i, e := range p.Exprs {
+		v, err := Eval(e, in)
+		if err != nil {
+			return nil, false, err
+		}
+		out[i] = v
+	}
+	return out, true, nil
 }
 
 // Limit implements LIMIT / OFFSET (Postgres: Limit node).
@@ -115,5 +146,20 @@ func (l *Limit) Close() error { return l.Child.Close() }
 // Constraints: O(1) state.
 // Postgres reference: ExecLimit() in src/backend/executor/nodeLimit.c
 func (l *Limit) Next() (types.Row, bool, error) {
-	panic("TODO: Problem 6.4")
+	if l.Count >= 0 && l.returned >= l.Count {
+		return nil, false, nil
+	}
+	for l.skipped < l.Offset {
+		_, ok, err := l.Child.Next()
+		if err != nil || !ok {
+			return nil, false, err
+		}
+		l.skipped++
+	}
+	row, ok, err := l.Child.Next()
+	if err != nil || !ok {
+		return nil, false, err
+	}
+	l.returned++
+	return row, true, nil
 }

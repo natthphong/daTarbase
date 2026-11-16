@@ -1,8 +1,9 @@
 package engine
 
 import (
+	tuple "github.com/natthphong/daTarbase/phase01_tuple"
 	txn "github.com/natthphong/daTarbase/phase09_txn"
-
+	"github.com/natthphong/daTarbase/pkg/exec"
 	"github.com/natthphong/daTarbase/pkg/types"
 )
 
@@ -71,5 +72,48 @@ func (s *SeqScan) Close() error { s.open, s.buf = false, nil; return nil }
 // Postgres reference: heapgettup_pagemode() / heap_prepare_pagescan() in
 // src/backend/access/heap/heapam.c
 func (s *SeqScan) Next() (types.Row, bool, error) {
-	panic("TODO: Problem 11.5")
+	if !s.open {
+		return nil, false, exec.ErrNotOpen
+	}
+	for s.pos >= len(s.buf) {
+		if s.next >= s.nblocks {
+			return nil, false, nil
+		}
+		pid := s.next
+		f, err := s.Heap.pool.FetchPage(pid)
+		if err != nil {
+			return nil, false, err
+		}
+		s.buf, s.pos = s.buf[:0], 0
+		for slot, data := range heapPage(f).Tuples() {
+			if slot == lsnSlot {
+				continue
+			}
+			hdr, err := tuple.DecodeHeader(data)
+			if err != nil {
+				s.Heap.pool.UnpinPage(pid, false)
+				return nil, false, err
+			}
+			if !Visible(hdr, s.Snap, s.Clog, s.Mine) {
+				continue
+			}
+			row, err := tuple.DeformTuple(s.Heap.Def.Schema, data)
+			if err != nil {
+				s.Heap.pool.UnpinPage(pid, false)
+				return nil, false, err
+			}
+			if s.EmitTID {
+				row = append(row, tidValue(types.TID{Page: pid, Slot: slot}))
+			}
+			s.buf = append(s.buf, row)
+		}
+		if err := s.Heap.pool.UnpinPage(pid, false); err != nil {
+			return nil, false, err
+		}
+		s.PagesRead++
+		s.next++
+	}
+	r := s.buf[s.pos]
+	s.pos++
+	return r, true, nil
 }

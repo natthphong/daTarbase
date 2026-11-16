@@ -106,7 +106,28 @@ func (db *DB) Crash(leak int) *Disk {
 // Constraints: O(len(data)) besides the 64-byte image.
 // Postgres reference: XLogInsert() + XLogRecordAssemble()'s doPageWrites / XLogCheckBufferNeedsBackup() in src/backend/access/transam/xloginsert.c
 func (db *DB) Update(txn types.TxnID, page types.PageID, off int, data []byte) (types.LSN, error) {
-	panic("TODO: Problem 10.7")
+	last, ok := db.att[txn]
+	if !ok {
+		return 0, ErrNoTxn
+	}
+	if len(data) == 0 || off < 0 || off+len(data) > PageDataSize {
+		return 0, ErrBadRange
+	}
+	p := db.BP.Page(page)
+	if _, dirty := db.BP.dirty[page]; !dirty {
+		fpi := db.Log.Append(Record{Type: RecFPI, Body: FPIBody{Page: page, Image: p.Data}.Encode()})
+		db.BP.dirty[page] = fpi
+		p.LSN = fpi
+	}
+	before := append([]byte(nil), p.Data[off:off+len(data)]...)
+	lsn := db.Log.Append(Record{
+		Type: RecUpdate, Txn: txn, PrevLSN: last,
+		Body: UpdateBody{Page: page, Off: uint16(off), Before: before, After: data}.Encode(),
+	})
+	copy(p.Data[off:], data)
+	p.LSN = lsn
+	db.att[txn] = lsn
+	return lsn, nil
 }
 
 // Problem 10.8 — Commit [Medium]
@@ -138,7 +159,17 @@ func (db *DB) Update(txn types.TxnID, page types.PageID, off int, data []byte) (
 // Constraints: commits of different transactions may run concurrently; -race clean.
 // Postgres reference: RecordTransactionCommit() in src/backend/access/transam/xact.c
 func (db *DB) Commit(txn types.TxnID) (types.LSN, error) {
-	panic("TODO: Problem 10.8")
+	db.mu.Lock()
+	last, ok := db.att[txn]
+	if !ok {
+		db.mu.Unlock()
+		return 0, ErrNoTxn
+	}
+	lsn := db.Log.Append(Record{Type: RecCommit, Txn: txn, PrevLSN: last})
+	delete(db.att, txn)
+	db.mu.Unlock()
+	db.Log.FlushUpTo(lsn)
+	return lsn, nil
 }
 
 // Problem 10.10 — Checkpoint [Easy]
@@ -169,5 +200,17 @@ func (db *DB) Commit(txn types.TxnID) (types.LSN, error) {
 // Constraints: O(|ATT| + |DPT|).
 // Postgres reference: CreateCheckPoint() in src/backend/access/transam/xlog.c (Postgres also flushes all dirty buffers — see README)
 func (db *DB) Checkpoint() (types.LSN, error) {
-	panic("TODO: Problem 10.10")
+	db.mu.Lock()
+	body := CheckpointBody{NextTxn: db.nextTxn}
+	for t, l := range db.att {
+		body.ATT = append(body.ATT, ATTEntry{Txn: t, LastLSN: l})
+	}
+	for p, l := range db.BP.dirty {
+		body.DPT = append(body.DPT, DPTEntry{Page: p, RecLSN: l})
+	}
+	lsn := db.Log.Append(Record{Type: RecCheckpoint, Body: body.Encode()})
+	db.mu.Unlock()
+	db.Log.FlushUpTo(lsn)
+	db.Disk.SetMaster(lsn)
+	return lsn, nil
 }

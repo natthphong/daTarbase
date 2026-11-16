@@ -90,5 +90,22 @@ func (r *ClockReplacer) Size() int { return r.size }
 // Constraints: at most (MaxUsageCount+1) full turns of the hand per call.
 // Postgres reference: StrategyGetBuffer() + ClockSweepTick() in src/backend/storage/buffer/freelist.c
 func (r *ClockReplacer) Evict() (FrameID, bool) {
-	panic("TODO: Problem 3.9")
+	if r.size == 0 {
+		return 0, false
+	}
+	n := len(r.usage)
+	for {
+		f := FrameID(r.hand)
+		r.hand = (r.hand + 1) % n
+		if !r.tracked[f] || !r.evictable[f] {
+			continue
+		}
+		if r.usage[f] > 0 {
+			r.usage[f]--
+			continue
+		}
+		r.tracked[f], r.evictable[f] = false, false
+		r.size--
+		return f, true
+	}
 }

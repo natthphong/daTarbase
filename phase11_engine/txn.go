@@ -2,10 +2,11 @@ package engine
 
 import (
 	"fmt"
+	"slices"
 
 	tuple "github.com/natthphong/daTarbase/phase01_tuple"
 	txn "github.com/natthphong/daTarbase/phase09_txn"
-
+	wal "github.com/natthphong/daTarbase/phase10_wal"
 	"github.com/natthphong/daTarbase/pkg/exec"
 	"github.com/natthphong/daTarbase/pkg/types"
 )
@@ -46,7 +47,10 @@ import (
 // Constraints: O(log |Xip|), no allocation besides the snapshot copy.
 // Postgres reference: HeapTupleSatisfiesMVCC() in src/backend/access/heap/heapam_visibility.c
 func Visible(h tuple.TupleHeader, snap *txn.Snapshot, clog *txn.Clog, mine txn.CurrentXids) bool {
-	panic("TODO: Problem 11.2")
+	v := &txn.Version{Xmin: h.Xmin, Xmax: h.Xmax}
+	s := *snap
+	s.CurCid = 1
+	return txn.TupleVisible(v, &s, clog, mine)
 }
 
 // Problem 11.3 — Txn.Snapshot [Medium]
@@ -78,7 +82,14 @@ func Visible(h tuple.TupleHeader, snap *txn.Snapshot, clog *txn.Clog, mine txn.C
 // Constraints: one GetSnapshot per call under RC, one per transaction under RR.
 // Postgres reference: GetTransactionSnapshot() in src/backend/utils/time/snapmgr.c
 func (t *Txn) Snapshot() (*txn.Snapshot, error) {
-	panic("TODO: Problem 11.3")
+	if t.done {
+		return nil, ErrTxnClosed
+	}
+	if t.Level != RepeatableRead || t.snap == nil {
+		t.snap = t.db.mgr.GetSnapshot(t.xid)
+	}
+	s := *t.snap
+	return &s, nil
 }
 
 // Problem 11.6 — Txn.Commit [Medium]
@@ -112,7 +123,22 @@ func (t *Txn) Snapshot() (*txn.Snapshot, error) {
 // Constraints: exactly one WAL flush per writing transaction.
 // Postgres reference: RecordTransactionCommit() in src/backend/access/transam/xact.c
 func (t *Txn) Commit() error {
-	panic("TODO: Problem 11.6")
+	if t.done {
+		return ErrTxnClosed
+	}
+	if t.xid == types.InvalidTxnID {
+		t.finish()
+		return nil
+	}
+	lsn := t.db.wal.Append(t.xid, wal.RecCommit, nil)
+	if err := t.db.wal.Flush(lsn); err != nil {
+		return err
+	}
+	if err := t.db.mgr.Commit(t.xid); err != nil {
+		return err
+	}
+	t.finish()
+	return nil
 }
 
 // Problem 11.7 — Txn.Rollback [Easy]
@@ -140,7 +166,17 @@ func (t *Txn) Commit() error {
 // Constraints: O(1), no I/O.
 // Postgres reference: RecordTransactionAbort() in src/backend/access/transam/xact.c
 func (t *Txn) Rollback() error {
-	panic("TODO: Problem 11.7")
+	if t.done {
+		return ErrTxnClosed
+	}
+	if t.xid != types.InvalidTxnID {
+		t.db.wal.Append(t.xid, wal.RecAbort, nil)
+		if err := t.db.mgr.Abort(t.xid); err != nil {
+			return err
+		}
+	}
+	t.finish()
+	return nil
 }
 
 // Problem 11.10 — Txn.Insert [Medium]
@@ -170,7 +206,31 @@ func (t *Txn) Rollback() error {
 // Postgres reference: ExecInsert() in src/backend/executor/nodeModifyTable.c,
 // ExecInsertIndexTuples() in execIndexing.c
 func (t *Txn) Insert(table string, row types.Row) (types.TID, error) {
-	panic("TODO: Problem 11.10")
+	if t.done {
+		return types.TID{}, ErrTxnClosed
+	}
+	h := t.db.heaps[table]
+	if h == nil {
+		return types.TID{}, fmt.Errorf("%w: %q", ErrNoSuchTable, table)
+	}
+	r, err := coerceRow(h.Def.Schema, row)
+	if err != nil {
+		return types.TID{}, err
+	}
+	tid, err := h.Insert(t.assignXid(), r)
+	if err != nil {
+		return types.TID{}, err
+	}
+	for _, ix := range t.db.indexesOf(table) {
+		item, err := ix.Entry(r, tid)
+		if err != nil {
+			return types.TID{}, err
+		}
+		if err := ix.Tree.Insert(item); err != nil {
+			return types.TID{}, err
+		}
+	}
+	return tid, nil
 }
 
 // Query runs a query as one statement and returns all its rows.
@@ -264,5 +324,56 @@ func (t *Txn) Delete(q *Query) (int, error) {
 // Constraints: one scan; targets materialised once.
 // Postgres reference: ExecUpdate() in src/backend/executor/nodeModifyTable.c, heap_update() in heapam.c
 func (t *Txn) Update(q *Query, set map[string]any) (int, error) {
-	panic("TODO: Problem 11.18")
+	if t.done {
+		return 0, ErrTxnClosed
+	}
+	if !q.isPlainScan() {
+		return 0, fmt.Errorf("%w: UPDATE takes Scan(table).Where(...) only", ErrBadQuery)
+	}
+	h := t.db.heaps[q.table]
+	if h == nil {
+		return 0, fmt.Errorf("%w: %q", ErrNoSuchTable, q.table)
+	}
+	type assign struct {
+		col int
+		val types.Value
+	}
+	names := make([]string, 0, len(set))
+	for k := range set {
+		names = append(names, k)
+	}
+	slices.Sort(names)
+	cols := qualifiedNames(h.Def)
+	var as []assign
+	for _, name := range names {
+		c, err := resolve(cols, name)
+		if err != nil {
+			return 0, err
+		}
+		v, err := coerceValue(h.Def.Schema.Columns[c].Kind, toValue(set[name]))
+		if err != nil {
+			return 0, err
+		}
+		as = append(as, assign{c, v})
+	}
+	_, rows, err := t.targets(q)
+	if err != nil {
+		return 0, err
+	}
+	n := 0
+	for _, r := range rows {
+		tid := valueTID(r[len(r)-1])
+		nr := slices.Clone(r[:len(r)-1])
+		for _, a := range as {
+			nr[a.col] = a.val
+		}
+		if err := h.Delete(t, tid); err != nil {
+			return n, err
+		}
+		if _, err := t.Insert(q.table, nr); err != nil {
+			return n, err
+		}
+		n++
+	}
+	return n, nil
 }

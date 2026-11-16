@@ -1,5 +1,10 @@
 package join
 
+import (
+	"math"
+	"slices"
+)
+
 // ColStats are the planner statistics of one join column (Postgres:
 // reltuples from pg_class, n_distinct and null_frac from pg_stats).
 type ColStats struct {
@@ -42,7 +47,19 @@ type ColStats struct {
 // Constraints: O(1).
 // Postgres reference: eqjoinsel_inner() in src/backend/utils/adt/selfuncs.c, clamp_row_est() in costsize.c
 func EstimateEquiJoinRows(r, s ColStats) float64 {
-	panic("TODO: Problem 8.13")
+	clamp := func(c ColStats) float64 {
+		nd := c.NDV
+		if c.Rows >= 1 && nd > c.Rows {
+			nd = c.Rows
+		}
+		return max(nd, 1)
+	}
+	sel := (1 - r.NullFrac) * (1 - s.NullFrac) / max(clamp(r), clamp(s))
+	rows := r.Rows * s.Rows * sel
+	if rows <= 1 {
+		return 1
+	}
+	return math.RoundToEven(rows)
 }
 
 // Problem 8.14 — BestJoinOrder [Hard]
@@ -84,5 +101,57 @@ func EstimateEquiJoinRows(r, s ColStats) float64 {
 // Constraints: O(2^n · n²) time.
 // Postgres reference: standard_join_search() / join_search_one_level() in src/backend/optimizer/path/allpaths.c, joinrels.c
 func BestJoinOrder(card []float64, sel [][]float64) ([]int, float64, error) {
-	panic("TODO: Problem 8.14")
+	n := len(card)
+	if n < 1 || n > 16 || len(sel) != n {
+		return nil, 0, ErrBadInput
+	}
+	for _, row := range sel {
+		if len(row) != n {
+			return nil, 0, ErrBadInput
+		}
+	}
+	type plan struct {
+		cost  float64
+		order []int
+	}
+	full := 1<<n - 1
+	size := make([]float64, full+1)
+	best := make([]*plan, full+1)
+	for set := 1; set <= full; set++ {
+		sz := 1.0
+		for i := 0; i < n; i++ {
+			if set&(1<<i) == 0 {
+				continue
+			}
+			sz *= card[i]
+			for j := i + 1; j < n; j++ {
+				if set&(1<<j) != 0 {
+					sz *= sel[i][j]
+				}
+			}
+		}
+		size[set] = sz
+	}
+	equal := func(a, b float64) bool { return math.Abs(a-b) <= 1e-9*max(math.Abs(a), math.Abs(b)) }
+	for i := 0; i < n; i++ {
+		best[1<<i] = &plan{0, []int{i}}
+	}
+	for set := 1; set <= full; set++ {
+		if best[set] != nil {
+			continue
+		}
+		for t := 0; t < n; t++ {
+			if set&(1<<t) == 0 {
+				continue
+			}
+			prev := best[set&^(1<<t)]
+			cand := &plan{prev.cost + size[set], append(slices.Clone(prev.order), t)}
+			cur := best[set]
+			if cur == nil || (!equal(cand.cost, cur.cost) && cand.cost < cur.cost) ||
+				(equal(cand.cost, cur.cost) && slices.Compare(cand.order, cur.order) < 0) {
+				best[set] = cand
+			}
+		}
+	}
+	return best[full].order, best[full].cost, nil
 }

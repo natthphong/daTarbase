@@ -1,5 +1,12 @@
 package heap
 
+import (
+	"math"
+	"math/rand/v2"
+
+	"github.com/natthphong/daTarbase/pkg/types"
+)
+
 // Problem 4.15 — SampleSystem [Medium]
 //
 // Implement TABLESAMPLE SYSTEM (percent) REPEATABLE (seed): pick whole pages at random and return every live tuple on the picked pages.
@@ -35,5 +42,24 @@ package heap
 // Postgres reference: system_nextsampleblock() in src/backend/access/tablesample/system.c
 // (Postgres hashes (block, seed) instead of drawing a sequence; same idea.)
 func SampleSystem(store *PageStore, percent float64, seed uint64) ([]Tuple, error) {
-	panic("TODO: Problem 4.15")
+	if math.IsNaN(percent) || percent < 0 || percent > 100 {
+		return nil, ErrBadPercent
+	}
+	rng := rand.New(rand.NewPCG(seed, 0))
+	out := []Tuple{}
+	for pg := 0; pg < store.NumPages(); pg++ {
+		if rng.Float64()*100 >= percent {
+			continue
+		}
+		p, err := store.ReadPage(types.PageID(pg))
+		if err != nil {
+			return nil, err
+		}
+		for i := 0; i < p.NumSlots(); i++ {
+			if !p.Dead[i] {
+				out = append(out, Tuple{TID: types.TID{Page: types.PageID(pg), Slot: types.SlotID(i)}, Data: p.Slots[i]})
+			}
+		}
+	}
+	return out, nil
 }

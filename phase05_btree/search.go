@@ -1,6 +1,8 @@
 package btree
 
 import (
+	"bytes"
+
 	"github.com/natthphong/daTarbase/pkg/types"
 )
 
@@ -32,7 +34,20 @@ import (
 // Postgres reference: _bt_compare() in src/backend/access/nbtree/nbtsearch.c
 // (the heap TID is compared last via BTreeTupleGetHeapTID).
 func CompareItems(a, b Item) int {
-	panic("TODO: Problem 5.1")
+	if c := bytes.Compare(a.Key, b.Key); c != 0 {
+		return c
+	}
+	switch {
+	case a.TID.Page < b.TID.Page:
+		return -1
+	case a.TID.Page > b.TID.Page:
+		return 1
+	case a.TID.Slot < b.TID.Slot:
+		return -1
+	case a.TID.Slot > b.TID.Slot:
+		return 1
+	}
+	return 0
 }
 
 // Problem 5.2 — LowerBound [Easy]
@@ -58,7 +73,16 @@ func CompareItems(a, b Item) int {
 // Constraints: O(log n) comparisons — a binary search, not a linear scan.
 // Postgres reference: _bt_binsrch() in src/backend/access/nbtree/nbtsearch.c
 func (n *Node) LowerBound(probe Item) int {
-	panic("TODO: Problem 5.2")
+	lo, hi := 0, len(n.Items)
+	for lo < hi {
+		mid := int(uint(lo+hi) >> 1)
+		if CompareItems(n.Items[mid], probe) < 0 {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	return lo
 }
 
 // Problem 5.3 — UpperBound [Easy]
@@ -85,7 +109,16 @@ func (n *Node) LowerBound(probe Item) int {
 // Constraints: O(log n) comparisons.
 // Postgres reference: _bt_binsrch() (internal pages) in src/backend/access/nbtree/nbtsearch.c
 func (n *Node) UpperBound(probe Item) int {
-	panic("TODO: Problem 5.3")
+	lo, hi := 0, len(n.Items)
+	for lo < hi {
+		mid := int(uint(lo+hi) >> 1)
+		if CompareItems(n.Items[mid], probe) <= 0 {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	return lo
 }
 
 // Problem 5.4 — Descend [Medium]
@@ -118,7 +151,17 @@ func (n *Node) UpperBound(probe Item) int {
 // Constraints: exactly Height reads, no writes.
 // Postgres reference: _bt_search() in src/backend/access/nbtree/nbtsearch.c
 func (t *Tree) Descend(probe Item) []Step {
-	panic("TODO: Problem 5.4")
+	path := make([]Step, 0, t.Height)
+	id := t.Root
+	for {
+		n := t.Store.Get(id)
+		if n.Leaf {
+			return append(path, Step{Node: n, Pos: n.LowerBound(probe)})
+		}
+		i := n.UpperBound(probe)
+		path = append(path, Step{Node: n, Pos: i})
+		id = n.Children[i]
+	}
 }
 
 // Problem 5.5 — Search [Medium]
@@ -155,5 +198,20 @@ func (t *Tree) Descend(probe Item) []Step {
 // Constraints: reads = Height + number of extra leaves visited. No writes.
 // Postgres reference: _bt_first() + _bt_next() in src/backend/access/nbtree/nbtsearch.c
 func (t *Tree) Search(key []byte) []types.TID {
-	panic("TODO: Problem 5.5")
+	path := t.Descend(Item{Key: key, TID: MinTID})
+	last := path[len(path)-1]
+	leaf, pos := last.Node, last.Pos
+	var out []types.TID
+	for {
+		for ; pos < len(leaf.Items); pos++ {
+			if !bytes.Equal(leaf.Items[pos].Key, key) {
+				return out
+			}
+			out = append(out, leaf.Items[pos].TID)
+		}
+		if leaf.Next == types.InvalidPageID {
+			return out
+		}
+		leaf, pos = t.Store.Get(leaf.Next), 0
+	}
 }

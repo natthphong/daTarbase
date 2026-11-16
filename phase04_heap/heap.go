@@ -52,7 +52,34 @@ func NewHeap() *Heap { return &Heap{Store: NewPageStore(), FSM: NewFSM()} }
 // Postgres reference: heap_insert() → RelationGetBufferForTuple() in
 // src/backend/access/heap/hio.c (RecordAndGetPageWithFreeSpace on a stale hint)
 func (h *Heap) Insert(data []byte) (types.TID, error) {
-	panic("TODO: Problem 4.5")
+	if len(data) == 0 {
+		return types.TID{}, ErrEmptyTuple
+	}
+	if len(data) > MaxTupleSize {
+		return types.TID{}, ErrTupleTooBig
+	}
+	need := len(data) + ItemOverhead
+	for {
+		id := h.FSM.Search(need)
+		if id == types.InvalidPageID {
+			break
+		}
+		p, err := h.Store.ReadPage(id)
+		if err != nil {
+			h.FSM.Update(id, 0)
+			continue
+		}
+		if p.FreeSpace() >= need {
+			slot := p.Add(data)
+			h.FSM.Update(id, p.FreeSpace())
+			return types.TID{Page: id, Slot: slot}, nil
+		}
+		h.FSM.Update(id, p.FreeSpace())
+	}
+	id, p := h.Store.Extend()
+	slot := p.Add(data)
+	h.FSM.Update(id, p.FreeSpace())
+	return types.TID{Page: id, Slot: slot}, nil
 }
 
 // Problem 4.6 — Heap.Fetch [Easy]
@@ -81,7 +108,28 @@ func (h *Heap) Insert(data []byte) (types.TID, error) {
 // Postgres reference: heap_fetch() and heap_get_latest_tid() in
 // src/backend/access/heap/heapam.c (heap_hot_search_buffer for same-page chains)
 func (h *Heap) Fetch(tid types.TID) ([]byte, types.TID, error) {
-	panic("TODO: Problem 4.6")
+	var p *MemPage
+	cur := types.InvalidPageID
+	for {
+		if p == nil || tid.Page != cur {
+			var err error
+			if p, err = h.Store.ReadPage(tid.Page); err != nil {
+				return nil, types.TID{}, ErrInvalidTID
+			}
+			cur = tid.Page
+		}
+		if int(tid.Slot) >= p.NumSlots() {
+			return nil, types.TID{}, ErrInvalidTID
+		}
+		if !p.Dead[tid.Slot] {
+			return p.Slots[tid.Slot], tid, nil
+		}
+		next := p.Forward[tid.Slot]
+		if next == InvalidTID {
+			return nil, types.TID{}, ErrTupleDead
+		}
+		tid = next
+	}
 }
 
 // Problem 4.7 — Heap.Delete [Easy]
@@ -110,7 +158,15 @@ func (h *Heap) Fetch(tid types.TID) ([]byte, types.TID, error) {
 // Constraints: exactly one ReadPage.
 // Postgres reference: heap_delete() in src/backend/access/heap/heapam.c
 func (h *Heap) Delete(tid types.TID) error {
-	panic("TODO: Problem 4.7")
+	p, err := h.Store.ReadPage(tid.Page)
+	if err != nil || int(tid.Slot) >= p.NumSlots() {
+		return ErrInvalidTID
+	}
+	if p.Dead[tid.Slot] {
+		return ErrTupleDead
+	}
+	p.Dead[tid.Slot] = true
+	return nil
 }
 
 // Problem 4.8 — Heap.Update [Medium]
@@ -153,5 +209,28 @@ func (h *Heap) Delete(tid types.TID) error {
 // may read other pages).
 // Postgres reference: heap_update() in src/backend/access/heap/heapam.c
 func (h *Heap) Update(tid types.TID, data []byte) (types.TID, error) {
-	panic("TODO: Problem 4.8")
+	if len(data) == 0 {
+		return types.TID{}, ErrEmptyTuple
+	}
+	if len(data) > MaxTupleSize {
+		return types.TID{}, ErrTupleTooBig
+	}
+	p, err := h.Store.ReadPage(tid.Page)
+	if err != nil || int(tid.Slot) >= p.NumSlots() {
+		return types.TID{}, ErrInvalidTID
+	}
+	if p.Dead[tid.Slot] {
+		return types.TID{}, ErrTupleDead
+	}
+	var newTID types.TID
+	if p.FreeSpace() >= len(data)+ItemOverhead {
+		slot := p.Add(data)
+		h.FSM.Update(tid.Page, p.FreeSpace())
+		newTID = types.TID{Page: tid.Page, Slot: slot}
+	} else if newTID, err = h.Insert(data); err != nil {
+		return types.TID{}, err
+	}
+	p.Dead[tid.Slot] = true
+	p.Forward[tid.Slot] = newTID
+	return newTID, nil
 }

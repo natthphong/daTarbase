@@ -76,7 +76,42 @@ func NewAccum(spec AggSpec) *Accum {
 // Constraints: O(1) amortized per row.
 // Postgres reference: advance_transition_function() in src/backend/executor/nodeAgg.c
 func (a *Accum) Advance(row types.Row) {
-	panic("TODO: Problem 7.8")
+	if a.Spec.Func == AggCountStar {
+		a.Count++
+		return
+	}
+	v := row[a.Spec.Col]
+	if v.IsNull() {
+		return
+	}
+	if a.Spec.Distinct {
+		k := v.HashKey()
+		if a.Seen[k] {
+			return
+		}
+		if a.Seen == nil {
+			a.Seen = map[string]bool{}
+		}
+		a.Seen[k] = true
+	}
+	a.Count++
+	switch a.Spec.Func {
+	case AggSum, AggAvg:
+		if v.Kind == types.KindFloat64 {
+			a.FloatSum += v.F
+			a.SawFloat = true
+		} else {
+			a.IntSum += v.I
+		}
+	case AggMin:
+		if a.Min.IsNull() || types.Compare(v, a.Min) < 0 {
+			a.Min = v
+		}
+	case AggMax:
+		if a.Max.IsNull() || types.Compare(v, a.Max) > 0 {
+			a.Max = v
+		}
+	}
 }
 
 // Problem 7.9 — Accum.Finalize [Easy]
@@ -102,7 +137,28 @@ func (a *Accum) Advance(row types.Row) {
 // Postgres reference: finalize_aggregate() in src/backend/executor/nodeAgg.c,
 // int8_avg / float8_avg in src/backend/utils/adt/
 func (a *Accum) Finalize() types.Value {
-	panic("TODO: Problem 7.9")
+	switch a.Spec.Func {
+	case AggCountStar, AggCount:
+		return types.Int64(a.Count)
+	case AggSum:
+		if a.Count == 0 {
+			return types.Null()
+		}
+		if a.SawFloat {
+			return types.Float64(float64(a.IntSum) + a.FloatSum)
+		}
+		return types.Int64(a.IntSum)
+	case AggAvg:
+		if a.Count == 0 {
+			return types.Null()
+		}
+		return types.Float64((float64(a.IntSum) + a.FloatSum) / float64(a.Count))
+	case AggMin:
+		return a.Min
+	case AggMax:
+		return a.Max
+	}
+	return types.Null()
 }
 
 // Problem 7.10 — HashAggregate [Medium]
@@ -142,7 +198,65 @@ func (a *Accum) Finalize() types.Value {
 // Constraints: one pass over the input; memory O(groups).
 // Postgres reference: agg_fill_hash_table() / agg_retrieve_hash_table() in src/backend/executor/nodeAgg.c
 func HashAggregate(child exec.Iterator, groupCols []int, aggs []AggSpec, having func(types.Row) bool) (out []types.Row, err error) {
-	panic("TODO: Problem 7.10")
+	if err := child.Open(); err != nil {
+		return nil, err
+	}
+	defer func() {
+		if cerr := child.Close(); err == nil {
+			err = cerr
+		}
+	}()
+	type group struct {
+		key   types.Row
+		accum []*Accum
+	}
+	newGroup := func(key types.Row) *group {
+		g := &group{key: key}
+		for _, s := range aggs {
+			g.accum = append(g.accum, NewAccum(s))
+		}
+		return g
+	}
+	table := map[string]*group{}
+	var order []*group
+	if len(groupCols) == 0 {
+		g := newGroup(nil)
+		table[""] = g
+		order = append(order, g)
+	}
+	for {
+		r, ok, err := child.Next()
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			break
+		}
+		key := make(types.Row, len(groupCols))
+		for i, c := range groupCols {
+			key[i] = r[c]
+		}
+		hk := key.HashKey()
+		g := table[hk]
+		if g == nil {
+			g = newGroup(key)
+			table[hk] = g
+			order = append(order, g)
+		}
+		for _, a := range g.accum {
+			a.Advance(r)
+		}
+	}
+	for _, g := range order {
+		row := append(types.Row{}, g.key...)
+		for _, a := range g.accum {
+			row = append(row, a.Finalize())
+		}
+		if having == nil || having(row) {
+			out = append(out, row)
+		}
+	}
+	return out, nil
 }
 
 // GroupAggregate is a streaming GROUP BY over input already sorted on the
@@ -206,5 +320,70 @@ func (g *GroupAggregate) Close() error { return g.Child.Close() }
 //
 // Postgres reference: agg_retrieve_direct() in src/backend/executor/nodeAgg.c
 func (g *GroupAggregate) Next() (types.Row, bool, error) {
-	panic("TODO: Problem 7.11")
+	sameGroup := func(a, b types.Row) bool {
+		for _, c := range g.GroupCols {
+			if !types.Identical(a[c], b[c]) {
+				return false
+			}
+		}
+		return true
+	}
+	for !g.done {
+		first := !g.started
+		g.started = true
+		if !g.hasPend {
+			r, ok, err := g.Child.Next()
+			if err != nil {
+				return nil, false, err
+			}
+			if !ok {
+				g.done = true
+				if !(first && len(g.GroupCols) == 0) {
+					return nil, false, nil
+				}
+			} else {
+				g.pending, g.hasPend = r, true
+			}
+		}
+		accs := make([]*Accum, len(g.Aggs))
+		for i, s := range g.Aggs {
+			accs[i] = NewAccum(s)
+		}
+		var key types.Row
+		if g.hasPend {
+			start := g.pending
+			g.hasPend = false
+			for _, c := range g.GroupCols {
+				key = append(key, start[c])
+			}
+			for _, a := range accs {
+				a.Advance(start)
+			}
+			for {
+				r, ok, err := g.Child.Next()
+				if err != nil {
+					return nil, false, err
+				}
+				if !ok {
+					g.done = true
+					break
+				}
+				if !sameGroup(start, r) {
+					g.pending, g.hasPend = r, true
+					break
+				}
+				for _, a := range accs {
+					a.Advance(r)
+				}
+			}
+		}
+		row := append(types.Row{}, key...)
+		for _, a := range accs {
+			row = append(row, a.Finalize())
+		}
+		if g.Having == nil || g.Having(row) {
+			return row, true, nil
+		}
+	}
+	return nil, false, nil
 }

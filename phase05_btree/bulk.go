@@ -1,5 +1,7 @@
 package btree
 
+import "github.com/natthphong/daTarbase/pkg/types"
+
 // Problem 5.19 — BulkLoad [Hard]
 //
 // Build a tree from sorted entries the way CREATE INDEX does: fill leaves left to right, then build each upper level bottom-up.
@@ -49,5 +51,85 @@ package btree
 // Postgres reference: _bt_load() / _bt_buildadd() / _bt_uppershutdown() in
 // src/backend/access/nbtree/nbtsort.c
 func BulkLoad(store *NodeStore, maxItems int, items []Item, fillfactor int) (*Tree, error) {
-	panic("TODO: Problem 5.19")
+	if fillfactor == 0 {
+		fillfactor = DefaultFillfactor
+	}
+	if fillfactor < 50 || fillfactor > 100 {
+		return nil, ErrBadFillfactor
+	}
+	for i := 1; i < len(items); i++ {
+		if CompareItems(items[i-1], items[i]) >= 0 {
+			return nil, ErrUnsorted
+		}
+	}
+	t := &Tree{Store: store, MaxItems: maxItems, Height: 1}
+	capacity := maxItems * fillfactor / 100
+	minItems := t.MinItems()
+	groups := func(n, c, m, max int) []int {
+		var g []int
+		for n > 0 {
+			s := min(c, n)
+			g = append(g, s)
+			n -= s
+		}
+		if k := len(g); k >= 2 && g[k-1] < m {
+			total := g[k-2] + g[k-1]
+			if total <= max {
+				g = append(g[:k-2], total)
+			} else {
+				g[k-2], g[k-1] = (total+1)/2, total/2
+			}
+		}
+		if len(g) == 0 {
+			g = []int{0}
+		}
+		return g
+	}
+
+	sizes := groups(len(items), capacity, minItems, maxItems)
+	leaves := make([]*Node, len(sizes))
+	for i := range leaves {
+		leaves[i] = store.Alloc(true)
+	}
+	ids := make([]types.PageID, len(leaves))
+	lows := make([]Item, len(leaves))
+	off := 0
+	for i, n := range leaves {
+		n.Items = append([]Item(nil), items[off:off+sizes[i]]...)
+		off += sizes[i]
+		if i > 0 {
+			n.Prev = leaves[i-1].ID
+		}
+		if i+1 < len(leaves) {
+			n.Next = leaves[i+1].ID
+		}
+		store.Put(n)
+		ids[i] = n.ID
+		if len(n.Items) > 0 {
+			lows[i] = Item{Key: n.Items[0].Key, TID: n.Items[0].TID}
+		}
+	}
+
+	for len(ids) > 1 {
+		sizes := groups(len(ids), capacity+1, minItems+1, maxItems+1)
+		parents := make([]*Node, len(sizes))
+		for i := range parents {
+			parents[i] = store.Alloc(false)
+		}
+		nextIDs := make([]types.PageID, len(parents))
+		nextLows := make([]Item, len(parents))
+		off := 0
+		for i, p := range parents {
+			p.Children = append([]types.PageID(nil), ids[off:off+sizes[i]]...)
+			p.Items = append([]Item(nil), lows[off+1:off+sizes[i]]...)
+			nextLows[i] = lows[off]
+			off += sizes[i]
+			store.Put(p)
+			nextIDs[i] = p.ID
+		}
+		ids, lows = nextIDs, nextLows
+		t.Height++
+	}
+	t.Root = ids[0]
+	return t, nil
 }

@@ -28,7 +28,12 @@ import "iter"
 // Constraints: O(1), no allocation.
 // Postgres reference: PageGetItemId + PageGetItem in src/include/storage/bufpage.h
 func (p *Page) GetTuple(slot SlotID) ([]byte, error) {
-	panic("TODO: Problem 2.4")
+	it, err := p.ItemID(slot)
+	if err != nil || it.Flags != LPNormal {
+		return nil, ErrInvalidSlot
+	}
+	end := int(it.Off) + int(it.Len)
+	return p.buf[it.Off:end:end], nil
 }
 
 // Problem 2.5 — InsertTuple [Medium]
@@ -70,7 +75,29 @@ func (p *Page) GetTuple(slot SlotID) ([]byte, error) {
 // Constraints: O(len(data) + NumSlots()), no new page buffer allocation.
 // Postgres reference: PageAddItemExtended() in src/backend/storage/page/bufpage.c
 func (p *Page) InsertTuple(data []byte) (SlotID, error) {
-	panic("TODO: Problem 2.5")
+	if len(data) == 0 {
+		return 0, ErrEmptyTuple
+	}
+	if len(data) > p.FreeSpace() {
+		return 0, ErrPageFull
+	}
+	n := p.NumSlots()
+	slot := SlotID(n)
+	for s := 0; s < n; s++ {
+		if it, _ := p.ItemID(SlotID(s)); it.Flags == LPUnused {
+			slot = SlotID(s)
+			break
+		}
+	}
+	if int(slot) == n {
+		p.setLower(p.Lower() + LinePointerLen)
+	}
+	upper := int(p.Upper())
+	newUpper := upper - len(data)
+	copy(p.buf[newUpper:upper], data)
+	p.setUpper(uint16(newUpper))
+	_ = p.SetItemID(slot, ItemID{Off: uint16(newUpper), Flags: LPNormal, Len: uint16(len(data))})
+	return slot, nil
 }
 
 // Problem 2.6 — Tuples [Easy]
@@ -97,7 +124,17 @@ func (p *Page) InsertTuple(data []byte) (SlotID, error) {
 // Constraints: O(NumSlots()) per full iteration, no allocation besides the closure.
 // Postgres reference: heapgettup_pagemode() / page_collect_tuples() in src/backend/access/heap/heapam.c
 func (p *Page) Tuples() iter.Seq2[SlotID, []byte] {
-	panic("TODO: Problem 2.6")
+	return func(yield func(SlotID, []byte) bool) {
+		for s := 0; s < p.NumSlots(); s++ {
+			data, err := p.GetTuple(SlotID(s))
+			if err != nil {
+				continue
+			}
+			if !yield(SlotID(s), data) {
+				return
+			}
+		}
+	}
 }
 
 // Problem 2.7 — DeleteTuple [Easy]
@@ -126,7 +163,12 @@ func (p *Page) Tuples() iter.Seq2[SlotID, []byte] {
 // Constraints: O(1).
 // Postgres reference: ItemIdMarkDead() in src/include/storage/itemid.h (used by heap_page_prune)
 func (p *Page) DeleteTuple(slot SlotID) error {
-	panic("TODO: Problem 2.7")
+	it, err := p.ItemID(slot)
+	if err != nil || it.Flags != LPNormal {
+		return ErrInvalidSlot
+	}
+	it.Flags = LPDead
+	return p.SetItemID(slot, it)
 }
 
 // Problem 2.8 — UpdateTuple [Medium]
@@ -159,5 +201,17 @@ func (p *Page) DeleteTuple(slot SlotID) error {
 // Constraints: O(len(data)).
 // Postgres reference: heap_inplace_update_and_unlock() in src/backend/access/heap/heapam.c
 func (p *Page) UpdateTuple(slot SlotID, data []byte) error {
-	panic("TODO: Problem 2.8")
+	it, err := p.ItemID(slot)
+	if err != nil || it.Flags != LPNormal {
+		return ErrInvalidSlot
+	}
+	if len(data) == 0 {
+		return ErrEmptyTuple
+	}
+	if len(data) > int(it.Len) {
+		return ErrNoRoom
+	}
+	copy(p.buf[it.Off:], data)
+	it.Len = uint16(len(data))
+	return p.SetItemID(slot, it)
 }

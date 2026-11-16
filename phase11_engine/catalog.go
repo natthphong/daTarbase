@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"path/filepath"
 
 	"github.com/natthphong/daTarbase/pkg/types"
 )
@@ -130,5 +131,32 @@ func LoadCatalog(path string) (*Catalog, error) {
 // Constraints: one write of data; never truncate path itself.
 // Postgres reference: durable_rename() in src/backend/storage/file/fd.c
 func WriteFileAtomic(path string, data []byte, sync bool) error {
-	panic("TODO: Problem 11.1")
+	tmp := path + ".tmp"
+	f, err := os.Create(tmp)
+	if err != nil {
+		return err
+	}
+	_, err = f.Write(data)
+	if err == nil && sync {
+		err = f.Sync()
+	}
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err == nil {
+		err = os.Rename(tmp, path)
+	}
+	if err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	if sync {
+		d, err := os.Open(filepath.Dir(path))
+		if err != nil {
+			return err
+		}
+		defer d.Close()
+		return d.Sync()
+	}
+	return nil
 }

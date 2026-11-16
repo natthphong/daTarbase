@@ -1,6 +1,9 @@
 package tuple
 
 import (
+	"encoding/binary"
+	"math"
+
 	"github.com/natthphong/daTarbase/pkg/types"
 )
 
@@ -56,5 +59,56 @@ const (
 // Postgres reference: none directly (Postgres B-trees call type comparators);
 // this is the memcomparable format of CockroachDB / MyRocks / FoundationDB tuples.
 func EncodeKey(values types.Row, desc []bool) ([]byte, error) {
-	panic("TODO: Problem 1.14")
+	if desc != nil && len(desc) != len(values) {
+		return nil, ErrArity
+	}
+	var out []byte
+	for i, v := range values {
+		start := len(out)
+		if v.IsNull() {
+			out = append(out, KeyTagNull)
+		} else {
+			out = append(out, KeyTagValue)
+			switch v.Kind {
+			case types.KindBool:
+				if v.B {
+					out = append(out, 1)
+				} else {
+					out = append(out, 0)
+				}
+			case types.KindInt32:
+				out = binary.BigEndian.AppendUint32(out, uint32(int32(v.I))^(1<<31))
+			case types.KindInt64:
+				out = binary.BigEndian.AppendUint64(out, uint64(v.I)^(1<<63))
+			case types.KindFloat64:
+				f := v.F
+				if f == 0 {
+					f = 0
+				} else if math.IsNaN(f) {
+					f = math.NaN()
+				}
+				b := math.Float64bits(f)
+				if b>>63 == 1 {
+					b = ^b
+				} else {
+					b |= 1 << 63
+				}
+				out = binary.BigEndian.AppendUint64(out, b)
+			case types.KindText:
+				for j := 0; j < len(v.S); j++ {
+					out = append(out, v.S[j])
+					if v.S[j] == 0 {
+						out = append(out, 0xFF)
+					}
+				}
+				out = append(out, 0x00, 0x01)
+			}
+		}
+		if desc != nil && desc[i] {
+			for j := start; j < len(out); j++ {
+				out[j] ^= 0xFF
+			}
+		}
+	}
+	return out, nil
 }

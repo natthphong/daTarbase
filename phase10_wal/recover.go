@@ -1,5 +1,7 @@
 package wal
 
+import "github.com/natthphong/daTarbase/pkg/types"
+
 // Problem 10.14 — Recover [Hard]
 //
 // Bring a freshly opened DB back to a consistent state after a crash: analysis, redo, undo — committed changes present, uncommitted ones gone.
@@ -34,5 +36,25 @@ package wal
 // Constraints: none beyond the subproblems.
 // Postgres reference: StartupXLOG() in src/backend/access/transam/xlog.c + PerformWalRecovery() in xlogrecovery.c
 func (db *DB) Recover() error {
-	panic("TODO: Problem 10.14")
+	a, err := Analyze(db.Log.Bytes(), db.Disk.Master())
+	if err != nil {
+		return err
+	}
+	db.Log.Truncate(a.End)
+	if _, err := db.RedoPass(a.DPT, a.RedoLSN); err != nil {
+		return err
+	}
+	db.mu.Lock()
+	db.att = a.ATT
+	db.nextTxn = a.NextTxn
+	losers := make([]types.TxnID, 0, len(a.ATT))
+	for t := range a.ATT {
+		losers = append(losers, t)
+	}
+	db.mu.Unlock()
+	if err := db.Undo(losers...); err != nil {
+		return err
+	}
+	db.Log.FlushUpTo(db.Log.End())
+	return nil
 }

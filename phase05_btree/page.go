@@ -1,6 +1,8 @@
 package btree
 
 import (
+	"encoding/binary"
+
 	"github.com/natthphong/daTarbase/pkg/types"
 )
 
@@ -47,7 +49,70 @@ import (
 // Postgres reference: BTPageOpaqueData + _bt_pgaddtup() in src/backend/access/nbtree/nbtinsert.c,
 // "minus infinity" item: P_FIRSTDATAKEY in src/include/access/nbtree.h
 func (n *Node) EncodePage() ([]byte, error) {
-	panic("TODO: Problem 5.20")
+	type tup struct {
+		key     []byte
+		tid     types.TID
+		payload []byte
+		child   types.PageID
+	}
+	var tups []tup
+	if n.Leaf {
+		for _, it := range n.Items {
+			tups = append(tups, tup{key: it.Key, tid: it.TID, payload: it.Payload})
+		}
+	} else {
+		for i, c := range n.Children {
+			tp := tup{child: c}
+			if i > 0 {
+				tp.key, tp.tid = n.Items[i-1].Key, n.Items[i-1].TID
+			}
+			tups = append(tups, tp)
+		}
+	}
+	size := func(tp tup) int {
+		if n.Leaf {
+			return 2 + len(tp.key) + 6 + 2 + len(tp.payload)
+		}
+		return 2 + len(tp.key) + 6 + 4
+	}
+	lower := PageHeaderSize + LinePointerSize*len(tups)
+	total := lower
+	for _, tp := range tups {
+		total += size(tp)
+	}
+	if total > types.PageSize {
+		return nil, ErrNodeTooLarge
+	}
+	buf := make([]byte, types.PageSize)
+	le := binary.LittleEndian
+	if n.Leaf {
+		le.PutUint16(buf[0:], 1)
+	}
+	le.PutUint16(buf[2:], uint16(len(tups)))
+	le.PutUint16(buf[4:], uint16(lower))
+	le.PutUint32(buf[8:], uint32(n.Prev))
+	le.PutUint32(buf[12:], uint32(n.Next))
+	upper := types.PageSize
+	for i, tp := range tups {
+		sz := size(tp)
+		upper -= sz
+		b := buf[upper : upper+sz]
+		le.PutUint16(b, uint16(len(tp.key)))
+		p := 2 + copy(b[2:], tp.key)
+		le.PutUint32(b[p:], uint32(tp.tid.Page))
+		le.PutUint16(b[p+4:], uint16(tp.tid.Slot))
+		if n.Leaf {
+			le.PutUint16(b[p+6:], uint16(len(tp.payload)))
+			copy(b[p+8:], tp.payload)
+		} else {
+			le.PutUint32(b[p+6:], uint32(tp.child))
+		}
+		lp := PageHeaderSize + LinePointerSize*i
+		le.PutUint16(buf[lp:], uint16(upper))
+		le.PutUint16(buf[lp+2:], uint16(sz))
+	}
+	le.PutUint16(buf[6:], uint16(upper))
+	return buf, nil
 }
 
 // Problem 5.21 — DecodePage [Medium]
@@ -79,5 +144,57 @@ func (n *Node) EncodePage() ([]byte, error) {
 // Constraints: O(page size); never panics on garbage input.
 // Postgres reference: PageGetItem() / _bt_checkpage() in src/backend/access/nbtree/nbtpage.c
 func DecodePage(id types.PageID, buf []byte) (*Node, error) {
-	panic("TODO: Problem 5.21")
+	if len(buf) != types.PageSize {
+		return nil, ErrCorruptPage
+	}
+	le := binary.LittleEndian
+	flags := le.Uint16(buf[0:])
+	nitems := int(le.Uint16(buf[2:]))
+	lower := int(le.Uint16(buf[4:]))
+	upper := int(le.Uint16(buf[6:]))
+	if flags > 1 || lower != PageHeaderSize+LinePointerSize*nitems || upper < lower || upper > types.PageSize {
+		return nil, ErrCorruptPage
+	}
+	n := &Node{
+		ID:   id,
+		Leaf: flags == 1,
+		Prev: types.PageID(le.Uint32(buf[8:])),
+		Next: types.PageID(le.Uint32(buf[12:])),
+	}
+	if !n.Leaf && nitems == 0 {
+		return nil, ErrCorruptPage
+	}
+	for i := 0; i < nitems; i++ {
+		lp := PageHeaderSize + LinePointerSize*i
+		off, sz := int(le.Uint16(buf[lp:])), int(le.Uint16(buf[lp+2:]))
+		if off < upper || off+sz > types.PageSize || sz < 2 {
+			return nil, ErrCorruptPage
+		}
+		b := buf[off : off+sz]
+		kl := int(le.Uint16(b))
+		fixed := 2 + kl + 6
+		if n.Leaf {
+			if sz < fixed+2 || sz != fixed+2+int(le.Uint16(b[fixed:])) {
+				return nil, ErrCorruptPage
+			}
+		} else if sz != fixed+4 {
+			return nil, ErrCorruptPage
+		}
+		it := Item{
+			Key: append([]byte{}, b[2:2+kl]...),
+			TID: types.TID{Page: types.PageID(le.Uint32(b[2+kl:])), Slot: types.SlotID(le.Uint16(b[6+kl:]))},
+		}
+		if n.Leaf {
+			if pl := b[fixed+2:]; len(pl) > 0 {
+				it.Payload = append([]byte(nil), pl...)
+			}
+			n.Items = append(n.Items, it)
+			continue
+		}
+		n.Children = append(n.Children, types.PageID(le.Uint32(b[fixed:])))
+		if i > 0 {
+			n.Items = append(n.Items, it)
+		}
+	}
+	return n, nil
 }

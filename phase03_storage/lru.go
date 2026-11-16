@@ -113,7 +113,12 @@ func (r *LRUReplacer) lruOrder() []FrameID {
 // Constraints: O(1) — no scanning of the list.
 // Postgres reference: none — Postgres uses a clock sweep (Problem 3.9), not LRU.
 func (r *LRUReplacer) RecordAccess(f FrameID) {
-	panic("TODO: Problem 3.7")
+	if e, ok := r.elems[f]; ok {
+		r.order.MoveToBack(e)
+		return
+	}
+	r.elems[f] = r.order.PushBack(f)
+	r.evictable[f] = false
 }
 
 // Problem 3.8 — LRUReplacer.Evict [Medium]
@@ -136,5 +141,15 @@ func (r *LRUReplacer) RecordAccess(f FrameID) {
 //
 // Constraints: O(1) when the front frame is evictable; O(number of pinned frames skipped) otherwise.
 func (r *LRUReplacer) Evict() (FrameID, bool) {
-	panic("TODO: Problem 3.8")
+	for e := r.order.Front(); e != nil; e = e.Next() {
+		f := e.Value.(FrameID)
+		if r.evictable[f] {
+			r.order.Remove(e)
+			delete(r.elems, f)
+			delete(r.evictable, f)
+			r.size--
+			return f, true
+		}
+	}
+	return 0, false
 }

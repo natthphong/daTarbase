@@ -1,7 +1,12 @@
 package engine
 
 import (
+	"fmt"
+	"path/filepath"
+
+	txn "github.com/natthphong/daTarbase/phase09_txn"
 	wal "github.com/natthphong/daTarbase/phase10_wal"
+	"github.com/natthphong/daTarbase/pkg/types"
 )
 
 // RecoveryStats reports what crash recovery did.
@@ -47,7 +52,26 @@ type RecoveryStats struct {
 // Constraints: the checkpoint record is the last thing written.
 // Postgres reference: CreateCheckPoint() in src/backend/access/transam/xlog.c
 func (db *DB) Checkpoint() error {
-	panic("TODO: Problem 11.20")
+	if db.closed {
+		return ErrClosed
+	}
+	if err := db.wal.Flush(db.wal.End()); err != nil {
+		return err
+	}
+	for _, td := range db.cat.Tables {
+		h := db.heaps[td.Name]
+		if err := h.pool.FlushAll(); err != nil {
+			return err
+		}
+		if err := h.disk.fsync(); err != nil {
+			return err
+		}
+	}
+	if err := saveClog(filepath.Join(db.dir, "pg_xact"), db.mgr.Clog, !db.opts.NoSync); err != nil {
+		return err
+	}
+	lsn := db.wal.Append(types.InvalidTxnID, wal.RecCheckpoint, encodeCheckpoint(db.mgr.NextXid))
+	return db.wal.Flush(lsn)
 }
 
 // Problem 11.21 — DB.Recover [Hard]
@@ -98,5 +122,93 @@ func (db *DB) Checkpoint() error {
 // Postgres reference: PerformWalRecovery() in src/backend/access/transam/xlogrecovery.c,
 // heap_xlog_insert() / heap_xlog_delete() in src/backend/access/heap/heapam.c
 func (db *DB) Recover(tail []wal.Record) (RecoveryStats, error) {
-	panic("TODO: Problem 11.21")
+	st := RecoveryStats{Records: len(tail)}
+	byRel := map[uint32]*TableHeap{}
+	for _, h := range db.heaps {
+		byRel[h.Def.RelID] = h
+	}
+	clog := db.mgr.Clog
+	for _, rec := range tail {
+		if rec.Txn != types.InvalidTxnID && !txn.TxnIDPrecedes(rec.Txn, db.mgr.NextXid) {
+			db.mgr.NextXid = rec.Txn + 1
+		}
+		switch rec.Type {
+		case wal.RecCommit:
+			if err := clog.Set(rec.Txn, txn.StatusCommitted); err != nil {
+				return st, err
+			}
+			st.Committed++
+		case wal.RecAbort:
+			if err := clog.Set(rec.Txn, txn.StatusAborted); err != nil {
+				return st, err
+			}
+			st.Aborted++
+		case wal.RecUpdate:
+			r, err := decodeHeapRecord(rec.Body)
+			if err != nil {
+				return st, err
+			}
+			h := byRel[r.Rel]
+			if h == nil {
+				return st, fmt.Errorf("%w: unknown relation %d at LSN %d", ErrCorruptWAL, r.Rel, rec.LSN)
+			}
+			for h.NumPages() <= r.Page {
+				if _, err := h.disk.AllocatePage(); err != nil {
+					return st, err
+				}
+			}
+			applied, err := redoHeap(h, r, rec.LSN)
+			if err != nil {
+				return st, err
+			}
+			if applied {
+				st.Applied++
+			} else {
+				st.Skipped++
+			}
+		}
+	}
+	return st, nil
+}
+
+// redoHeap applies one heap record to its page unless the page already has it.
+//
+// solution-only
+func redoHeap(h *TableHeap, r heapRecord, lsn types.LSN) (bool, error) {
+	f, err := h.pool.FetchPage(r.Page)
+	if err != nil {
+		return false, err
+	}
+	p := heapPage(f)
+	if pageLSN(p) >= lsn {
+		return false, h.pool.UnpinPage(r.Page, false)
+	}
+	switch r.Op {
+	case opInsert:
+		slot, err := p.InsertTuple(r.Tuple)
+		if err == nil && slot != r.Slot {
+			err = fmt.Errorf("%w: insert at LSN %d went to slot %d, log says %d", ErrRedoMismatch, lsn, slot, r.Slot)
+		}
+		if err != nil {
+			h.pool.UnpinPage(r.Page, false)
+			return false, err
+		}
+	case opDelete:
+		data, err := p.GetTuple(r.Slot)
+		if err != nil {
+			h.pool.UnpinPage(r.Page, false)
+			return false, fmt.Errorf("%w: delete at LSN %d: %v", ErrRedoMismatch, lsn, err)
+		}
+		setXmax(data, r.Xmax)
+	case opPrune:
+		for _, s := range r.Slots {
+			if err := p.DeleteTuple(s); err != nil {
+				h.pool.UnpinPage(r.Page, true)
+				return false, fmt.Errorf("%w: prune at LSN %d: %v", ErrRedoMismatch, lsn, err)
+			}
+		}
+		p.Compact()
+	}
+	setPageLSN(p, lsn)
+	return true, h.pool.UnpinPage(r.Page, true)
 }

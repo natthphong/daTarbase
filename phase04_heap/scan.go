@@ -1,6 +1,8 @@
 package heap
 
 import (
+	"slices"
+
 	"github.com/natthphong/daTarbase/pkg/types"
 )
 
@@ -47,7 +49,27 @@ func NewSeqScan(s *PageStore) *SeqScan { return &SeqScan{store: s, nblocks: s.Nu
 // Constraints: O(1) extra memory; at most one ReadPage per page.
 // Postgres reference: heapgettup_pagemode() in src/backend/access/heap/heapam.c
 func (s *SeqScan) Next() (Tuple, bool, error) {
-	panic("TODO: Problem 4.9")
+	for {
+		if s.cur == nil {
+			if s.next >= s.nblocks {
+				return Tuple{}, false, nil
+			}
+			p, err := s.store.ReadPage(types.PageID(s.next))
+			if err != nil {
+				return Tuple{}, false, err
+			}
+			s.cur, s.page, s.slot = p, types.PageID(s.next), 0
+			s.next++
+		}
+		for s.slot < s.cur.NumSlots() {
+			i := s.slot
+			s.slot++
+			if !s.cur.Dead[i] {
+				return Tuple{TID: types.TID{Page: s.page, Slot: types.SlotID(i)}, Data: s.cur.Slots[i]}, true, nil
+			}
+		}
+		s.cur = nil
+	}
 }
 
 // SyncLocation is the shared "where is the scan of this table right now"
@@ -112,7 +134,31 @@ func NewSyncScan(s *PageStore, loc *SyncLocation) *SyncScan {
 // Postgres reference: ss_get_location() / ss_report_location() in
 // src/backend/access/common/syncscan.c, used by heapgettup()
 func (s *SyncScan) Next() (Tuple, bool, error) {
-	panic("TODO: Problem 4.10")
+	for {
+		if s.cur == nil {
+			if s.read >= s.nblocks {
+				return Tuple{}, false, nil
+			}
+			id := types.PageID((int(s.start) + s.read) % s.nblocks)
+			p, err := s.store.ReadPage(id)
+			if err != nil {
+				return Tuple{}, false, err
+			}
+			s.read++
+			s.cur, s.page, s.slot = p, id, 0
+			if s.loc != nil {
+				s.loc.Page = id
+			}
+		}
+		for s.slot < s.cur.NumSlots() {
+			i := s.slot
+			s.slot++
+			if !s.cur.Dead[i] {
+				return Tuple{TID: types.TID{Page: s.page, Slot: types.SlotID(i)}, Data: s.cur.Slots[i]}, true, nil
+			}
+		}
+		s.cur = nil
+	}
 }
 
 // Problem 4.11 — TIDRangeScan [Easy]
@@ -144,7 +190,30 @@ func (s *SyncScan) Next() (Tuple, bool, error) {
 // Postgres reference: heap_set_tidrange() / heap_getnextslot_tidrange() in
 // src/backend/access/heap/heapam.c (TID Range Scan, PG 14+)
 func TIDRangeScan(store *PageStore, lo, hi types.TID) []Tuple {
-	panic("TODO: Problem 4.11")
+	out := []Tuple{}
+	if hi.Less(lo) {
+		return out
+	}
+	last := uint64(hi.Page)
+	if n := uint64(store.NumPages()); n == 0 {
+		return out
+	} else if last > n-1 {
+		last = n - 1
+	}
+	for pg := uint64(lo.Page); pg <= last; pg++ {
+		p, err := store.ReadPage(types.PageID(pg))
+		if err != nil {
+			break
+		}
+		for i := 0; i < p.NumSlots(); i++ {
+			tid := types.TID{Page: types.PageID(pg), Slot: types.SlotID(i)}
+			if tid.Less(lo) || hi.Less(tid) || p.Dead[i] {
+				continue
+			}
+			out = append(out, Tuple{TID: tid, Data: p.Slots[i]})
+		}
+	}
+	return out
 }
 
 // Problem 4.12 — BitmapHeapScan [Medium]
@@ -182,5 +251,45 @@ func TIDRangeScan(store *PageStore, lo, hi types.TID) []Tuple {
 // src/backend/nodes/tidbitmap.c and heapam_scan_bitmap_next_block() in
 // src/backend/access/heap/heapam_handler.c
 func BitmapHeapScan(store *PageStore, tids []types.TID, lossy []types.PageID) []Tuple {
-	panic("TODO: Problem 4.12")
+	type entry struct {
+		lossy bool
+		slots map[types.SlotID]bool
+	}
+	bm := map[types.PageID]*entry{}
+	get := func(p types.PageID) *entry {
+		e := bm[p]
+		if e == nil {
+			e = &entry{slots: map[types.SlotID]bool{}}
+			bm[p] = e
+		}
+		return e
+	}
+	for _, t := range tids {
+		get(t.Page).slots[t.Slot] = true
+	}
+	for _, p := range lossy {
+		get(p).lossy = true
+	}
+	pages := make([]types.PageID, 0, len(bm))
+	for p := range bm {
+		if uint64(p) < uint64(store.NumPages()) {
+			pages = append(pages, p)
+		}
+	}
+	slices.Sort(pages)
+	out := []Tuple{}
+	for _, pg := range pages {
+		p, err := store.ReadPage(pg)
+		if err != nil {
+			continue
+		}
+		e := bm[pg]
+		for i := 0; i < p.NumSlots(); i++ {
+			if p.Dead[i] || (!e.lossy && !e.slots[types.SlotID(i)]) {
+				continue
+			}
+			out = append(out, Tuple{TID: types.TID{Page: pg, Slot: types.SlotID(i)}, Data: p.Slots[i]})
+		}
+	}
+	return out
 }

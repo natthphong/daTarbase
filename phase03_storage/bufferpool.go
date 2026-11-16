@@ -118,7 +118,24 @@ func (bp *BufferPool) FreeFrames() int {
 //
 // Postgres reference: UnpinBuffer() + MarkBufferDirty() in src/backend/storage/buffer/bufmgr.c
 func (bp *BufferPool) UnpinPage(id types.PageID, dirty bool) error {
-	panic("TODO: Problem 3.11")
+	bp.mu.Lock()
+	defer bp.mu.Unlock()
+	fid, ok := bp.pageTable[id]
+	if !ok {
+		return ErrPageNotResident
+	}
+	f := bp.frames[fid]
+	if f.PinCount == 0 {
+		return ErrNotPinned
+	}
+	if dirty {
+		f.Dirty = true
+	}
+	f.PinCount--
+	if f.PinCount == 0 {
+		bp.replacer.SetEvictable(fid, true)
+	}
+	return nil
 }
 
 // Problem 3.12 — acquireFrame [Medium]
@@ -150,7 +167,26 @@ func (bp *BufferPool) UnpinPage(id types.PageID, dirty bool) error {
 //
 // Postgres reference: BufferAlloc() + StrategyGetBuffer() + FlushBuffer() in src/backend/storage/buffer/
 func (bp *BufferPool) acquireFrame() (FrameID, error) {
-	panic("TODO: Problem 3.12")
+	if len(bp.freeList) > 0 {
+		fid := bp.freeList[0]
+		bp.freeList = bp.freeList[1:]
+		return fid, nil
+	}
+	fid, ok := bp.replacer.Evict()
+	if !ok {
+		return 0, ErrNoFreeFrames
+	}
+	f := bp.frames[fid]
+	if f.Dirty {
+		if err := bp.disk.WritePage(f.PageID, f.Data); err != nil {
+			bp.replacer.RecordAccess(fid)
+			bp.replacer.SetEvictable(fid, true)
+			return 0, err
+		}
+	}
+	delete(bp.pageTable, f.PageID)
+	f.PageID, f.Dirty, f.PinCount = types.InvalidPageID, false, 0
+	return fid, nil
 }
 
 // Problem 3.13 — FetchPage [Hard]
@@ -184,7 +220,29 @@ func (bp *BufferPool) acquireFrame() (FrameID, error) {
 //
 // Postgres reference: ReadBuffer() -> ReadBuffer_common() -> BufferAlloc() in src/backend/storage/buffer/bufmgr.c
 func (bp *BufferPool) FetchPage(id types.PageID) (*Frame, error) {
-	panic("TODO: Problem 3.13")
+	bp.mu.Lock()
+	defer bp.mu.Unlock()
+	if fid, ok := bp.pageTable[id]; ok {
+		f := bp.frames[fid]
+		f.PinCount++
+		bp.replacer.RecordAccess(fid)
+		bp.replacer.SetEvictable(fid, false)
+		return f, nil
+	}
+	fid, err := bp.acquireFrame()
+	if err != nil {
+		return nil, err
+	}
+	f := bp.frames[fid]
+	if err := bp.disk.ReadPage(id, f.Data); err != nil {
+		bp.freeList = append(bp.freeList, fid)
+		return nil, err
+	}
+	f.PageID, f.PinCount, f.Dirty = id, 1, false
+	bp.pageTable[id] = fid
+	bp.replacer.RecordAccess(fid)
+	bp.replacer.SetEvictable(fid, false)
+	return f, nil
 }
 
 // Problem 3.14 — NewPage [Medium]
@@ -210,7 +268,24 @@ func (bp *BufferPool) FetchPage(id types.PageID) (*Frame, error) {
 //
 // Postgres reference: ExtendBufferedRel() in src/backend/storage/buffer/bufmgr.c
 func (bp *BufferPool) NewPage() (*Frame, error) {
-	panic("TODO: Problem 3.14")
+	bp.mu.Lock()
+	defer bp.mu.Unlock()
+	fid, err := bp.acquireFrame()
+	if err != nil {
+		return nil, err
+	}
+	id, err := bp.disk.AllocatePage()
+	if err != nil {
+		bp.freeList = append(bp.freeList, fid)
+		return nil, err
+	}
+	f := bp.frames[fid]
+	clear(f.Data)
+	f.PageID, f.PinCount, f.Dirty = id, 1, false
+	bp.pageTable[id] = fid
+	bp.replacer.RecordAccess(fid)
+	bp.replacer.SetEvictable(fid, false)
+	return f, nil
 }
 
 // Problem 3.15 — FlushPage [Easy]
@@ -235,7 +310,21 @@ func (bp *BufferPool) NewPage() (*Frame, error) {
 //
 // Postgres reference: FlushOneBuffer() / FlushBuffer() in src/backend/storage/buffer/bufmgr.c
 func (bp *BufferPool) FlushPage(id types.PageID) error {
-	panic("TODO: Problem 3.15")
+	bp.mu.Lock()
+	defer bp.mu.Unlock()
+	fid, ok := bp.pageTable[id]
+	if !ok {
+		return ErrPageNotResident
+	}
+	f := bp.frames[fid]
+	if !f.Dirty {
+		return nil
+	}
+	if err := bp.disk.WritePage(id, f.Data); err != nil {
+		return err
+	}
+	f.Dirty = false
+	return nil
 }
 
 // Problem 3.16 — FlushAll [Easy]
@@ -260,5 +349,22 @@ func (bp *BufferPool) FlushPage(id types.PageID) error {
 //
 // Postgres reference: BufferSync() in src/backend/storage/buffer/bufmgr.c (it also sorts by file+block)
 func (bp *BufferPool) FlushAll() error {
-	panic("TODO: Problem 3.16")
+	bp.mu.Lock()
+	defer bp.mu.Unlock()
+	ids := make([]types.PageID, 0, len(bp.pageTable))
+	for id := range bp.pageTable {
+		ids = append(ids, id)
+	}
+	slices.Sort(ids)
+	for _, id := range ids {
+		f := bp.frames[bp.pageTable[id]]
+		if !f.Dirty {
+			continue
+		}
+		if err := bp.disk.WritePage(id, f.Data); err != nil {
+			return err
+		}
+		f.Dirty = false
+	}
+	return nil
 }

@@ -2,6 +2,7 @@ package txn
 
 import (
 	"errors"
+	"slices"
 
 	"github.com/natthphong/daTarbase/pkg/types"
 )
@@ -107,7 +108,24 @@ func (lm *LockManager) Waiters(tag LockTag) []LockRequest {
 // Constraints: O(1). Hint: Postgres stores one bitmask of conflicting modes per mode.
 // Postgres reference: LockConflicts[] in src/backend/storage/lmgr/lock.c
 func LockConflicts(a, b LockMode) bool {
-	panic("TODO: Problem 9.16")
+	bit := func(ms ...LockMode) uint16 {
+		var m uint16
+		for _, x := range ms {
+			m |= 1 << x
+		}
+		return m
+	}
+	table := [9]uint16{
+		AccessShareLock:          bit(AccessExclusiveLock),
+		RowShareLock:             bit(ExclusiveLock, AccessExclusiveLock),
+		RowExclusiveLock:         bit(ShareLock, ShareRowExclusiveLock, ExclusiveLock, AccessExclusiveLock),
+		ShareUpdateExclusiveLock: bit(ShareUpdateExclusiveLock, ShareLock, ShareRowExclusiveLock, ExclusiveLock, AccessExclusiveLock),
+		ShareLock:                bit(RowExclusiveLock, ShareUpdateExclusiveLock, ShareRowExclusiveLock, ExclusiveLock, AccessExclusiveLock),
+		ShareRowExclusiveLock:    bit(RowExclusiveLock, ShareUpdateExclusiveLock, ShareLock, ShareRowExclusiveLock, ExclusiveLock, AccessExclusiveLock),
+		ExclusiveLock:            bit(RowShareLock, RowExclusiveLock, ShareUpdateExclusiveLock, ShareLock, ShareRowExclusiveLock, ExclusiveLock, AccessExclusiveLock),
+		AccessExclusiveLock:      bit(AccessShareLock, RowShareLock, RowExclusiveLock, ShareUpdateExclusiveLock, ShareLock, ShareRowExclusiveLock, ExclusiveLock, AccessExclusiveLock),
+	}
+	return table[a]&(1<<b) != 0
 }
 
 // Problem 9.17 — Acquire [Medium]
@@ -140,7 +158,42 @@ func LockConflicts(a, b LockMode) bool {
 // Constraints: O(granted + waiting) per call, plus the scan for rule 2.
 // Postgres reference: LockAcquireExtended() / LockCheckConflicts() in src/backend/storage/lmgr/lock.c
 func (lm *LockManager) Acquire(xid types.TxnID, tag LockTag, mode LockMode) (bool, error) {
-	panic("TODO: Problem 9.17")
+	if mode < AccessShareLock || mode > AccessExclusiveLock {
+		return false, ErrBadLockMode
+	}
+	for _, s := range lm.Locks {
+		for _, w := range s.Waiting {
+			if w.Xid == xid {
+				return false, ErrAlreadyWaiting
+			}
+		}
+	}
+	s := lm.Locks[tag]
+	if s == nil {
+		s = &LockState{}
+		lm.Locks[tag] = s
+	}
+	req := LockRequest{Xid: xid, Mode: mode}
+	blocked := false
+	for _, g := range s.Granted {
+		if g == req {
+			return true, nil
+		}
+		if g.Xid != xid && LockConflicts(g.Mode, mode) {
+			blocked = true
+		}
+	}
+	for _, w := range s.Waiting {
+		if LockConflicts(w.Mode, mode) {
+			blocked = true
+		}
+	}
+	if blocked {
+		s.Waiting = append(s.Waiting, req)
+		return false, nil
+	}
+	s.Granted = append(s.Granted, req)
+	return true, nil
 }
 
 // Problem 9.18 — Release [Hard]
@@ -168,7 +221,49 @@ func (lm *LockManager) Acquire(xid types.TxnID, tag LockTag, mode LockMode) (boo
 // Constraints: O(granted × waiting).
 // Postgres reference: LockRelease() / ProcLockWakeup() in src/backend/storage/lmgr/proc.c
 func (lm *LockManager) Release(xid types.TxnID, tag LockTag) []LockRequest {
-	panic("TODO: Problem 9.18")
+	s := lm.Locks[tag]
+	if s == nil {
+		return nil
+	}
+	without := func(rs []LockRequest) []LockRequest {
+		out := rs[:0]
+		for _, r := range rs {
+			if r.Xid != xid {
+				out = append(out, r)
+			}
+		}
+		return out
+	}
+	s.Granted, s.Waiting = without(s.Granted), without(s.Waiting)
+
+	var woken []LockRequest
+	var ahead []LockMode
+	still := s.Waiting[:0]
+	for _, w := range s.Waiting {
+		ok := true
+		for _, g := range s.Granted {
+			if g.Xid != w.Xid && LockConflicts(g.Mode, w.Mode) {
+				ok = false
+			}
+		}
+		for _, m := range ahead {
+			if LockConflicts(m, w.Mode) {
+				ok = false
+			}
+		}
+		if ok {
+			s.Granted = append(s.Granted, w)
+			woken = append(woken, w)
+		} else {
+			still = append(still, w)
+			ahead = append(ahead, w.Mode)
+		}
+	}
+	s.Waiting = still
+	if len(s.Granted) == 0 && len(s.Waiting) == 0 {
+		delete(lm.Locks, tag)
+	}
+	return woken
 }
 
 // Problem 9.19 — DetectDeadlock [Medium]
@@ -203,5 +298,47 @@ func (lm *LockManager) Release(xid types.TxnID, tag LockTag) []LockRequest {
 // Constraints: O(V·(V+E)) is fine.
 // Postgres reference: DeadLockCheck() / FindLockCycle() in src/backend/storage/lmgr/deadlock.c
 func (lm *LockManager) DetectDeadlock() ([]types.TxnID, types.TxnID) {
-	panic("TODO: Problem 9.19")
+	edges := map[types.TxnID][]types.TxnID{}
+	for _, s := range lm.Locks {
+		for i, w := range s.Waiting {
+			for _, g := range s.Granted {
+				if g.Xid != w.Xid && LockConflicts(g.Mode, w.Mode) {
+					edges[w.Xid] = append(edges[w.Xid], g.Xid)
+				}
+			}
+			for _, e := range s.Waiting[:i] {
+				if e.Xid != w.Xid && LockConflicts(e.Mode, w.Mode) {
+					edges[w.Xid] = append(edges[w.Xid], e.Xid)
+				}
+			}
+		}
+	}
+	reachesSelf := func(start types.TxnID) bool {
+		seen := map[types.TxnID]bool{}
+		stack := append([]types.TxnID(nil), edges[start]...)
+		for len(stack) > 0 {
+			x := stack[len(stack)-1]
+			stack = stack[:len(stack)-1]
+			if x == start {
+				return true
+			}
+			if seen[x] {
+				continue
+			}
+			seen[x] = true
+			stack = append(stack, edges[x]...)
+		}
+		return false
+	}
+	var dead []types.TxnID
+	for x := range edges {
+		if reachesSelf(x) {
+			dead = append(dead, x)
+		}
+	}
+	if len(dead) == 0 {
+		return nil, types.InvalidTxnID
+	}
+	slices.Sort(dead)
+	return dead, dead[len(dead)-1]
 }

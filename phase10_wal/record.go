@@ -1,5 +1,12 @@
 package wal
 
+import (
+	"encoding/binary"
+	"hash/crc32"
+
+	"github.com/natthphong/daTarbase/pkg/types"
+)
+
 // Problem 10.1 — EncodeRecord [Easy]
 //
 // Serialise a record into its on-disk bytes: 29-byte header + body, with a CRC-32C over everything after the CRC field.
@@ -32,7 +39,16 @@ package wal
 // Constraints: one allocation.
 // Postgres reference: XLogRecordAssemble() + COMP_CRC32C in src/backend/access/transam/xloginsert.c
 func EncodeRecord(r Record) []byte {
-	panic("TODO: Problem 10.1")
+	n := HeaderSize + len(r.Body)
+	b := make([]byte, n)
+	binary.LittleEndian.PutUint32(b[0:], uint32(n))
+	binary.LittleEndian.PutUint64(b[8:], uint64(r.LSN))
+	binary.LittleEndian.PutUint64(b[16:], uint64(r.PrevLSN))
+	binary.LittleEndian.PutUint32(b[24:], uint32(r.Txn))
+	b[28] = byte(r.Type)
+	copy(b[HeaderSize:], r.Body)
+	binary.LittleEndian.PutUint32(b[4:], crc32.Checksum(b[8:], crcTable))
+	return b
 }
 
 // Problem 10.2 — DecodeRecord [Medium]
@@ -69,5 +85,31 @@ func EncodeRecord(r Record) []byte {
 // Constraints: O(TotalLen).
 // Postgres reference: ValidXLogRecordHeader() + ValidXLogRecord() in src/backend/access/transam/xlogreader.c
 func DecodeRecord(buf []byte) (Record, int, error) {
-	panic("TODO: Problem 10.2")
+	if len(buf) < 4 {
+		return Record{}, 0, ErrShortRecord
+	}
+	n := binary.LittleEndian.Uint32(buf)
+	if n < HeaderSize || n > MaxRecordLen {
+		return Record{}, 0, ErrCorruptRecord
+	}
+	if len(buf) < int(n) {
+		return Record{}, 0, ErrShortRecord
+	}
+	if binary.LittleEndian.Uint32(buf[4:]) != crc32.Checksum(buf[8:n], crcTable) {
+		return Record{}, 0, ErrBadCRC
+	}
+	t := RecordType(buf[28])
+	if !t.Valid() {
+		return Record{}, 0, ErrCorruptRecord
+	}
+	r := Record{
+		LSN:     types.LSN(binary.LittleEndian.Uint64(buf[8:])),
+		PrevLSN: types.LSN(binary.LittleEndian.Uint64(buf[16:])),
+		Txn:     types.TxnID(binary.LittleEndian.Uint32(buf[24:])),
+		Type:    t,
+	}
+	if n > HeaderSize {
+		r.Body = append([]byte(nil), buf[HeaderSize:n]...)
+	}
+	return r, int(n), nil
 }

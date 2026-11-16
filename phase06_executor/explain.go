@@ -1,5 +1,10 @@
 package executor
 
+import (
+	"fmt"
+	"strings"
+)
+
 // Plan is one node of a plan tree as EXPLAIN shows it (Postgres: Plan + the
 // bits ExplainNode prints).
 type Plan struct {
@@ -52,5 +57,41 @@ type Plan struct {
 // Constraints: O(nodes).
 // Postgres reference: ExplainNode() in src/backend/commands/explain.c
 func Explain(p *Plan) string {
-	panic("TODO: Problem 6.15")
+	var lines []string
+	var walk func(n *Plan, d int)
+	walk = func(n *Plan, d int) {
+		h := n.Node
+		switch {
+		case n.Index != "" && n.Relation != "":
+			h += " using " + n.Index + " on " + n.Relation
+		case n.Index != "":
+			h += " on " + n.Index
+		case n.Relation != "":
+			h += " on " + n.Relation
+		}
+		h += fmt.Sprintf("  (cost=%.2f..%.2f rows=%d width=%d)", n.StartupCost, n.TotalCost, n.Rows, n.Width)
+		detail := "  "
+		if d > 0 {
+			h = strings.Repeat(" ", 6*(d-1)+2) + "->  " + h
+			detail = strings.Repeat(" ", 6*d+2)
+		}
+		lines = append(lines, h)
+		if n.IndexCond != nil {
+			lines = append(lines, detail+"Index Cond: "+n.IndexCond.String())
+		}
+		if n.RecheckCond != nil {
+			lines = append(lines, detail+"Recheck Cond: "+n.RecheckCond.String())
+		}
+		if n.Filter != nil {
+			lines = append(lines, detail+"Filter: "+n.Filter.String())
+		}
+		for _, c := range n.Children {
+			walk(c, d+1)
+		}
+	}
+	if p == nil {
+		return ""
+	}
+	walk(p, 0)
+	return strings.Join(lines, "\n")
 }

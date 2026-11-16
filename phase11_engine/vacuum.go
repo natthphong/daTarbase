@@ -1,5 +1,16 @@
 package engine
 
+import (
+	"errors"
+	"fmt"
+
+	tuple "github.com/natthphong/daTarbase/phase01_tuple"
+	btree "github.com/natthphong/daTarbase/phase05_btree"
+	txn "github.com/natthphong/daTarbase/phase09_txn"
+	wal "github.com/natthphong/daTarbase/phase10_wal"
+	"github.com/natthphong/daTarbase/pkg/types"
+)
+
 // VacuumStats reports what one VACUUM did.
 type VacuumStats struct {
 	Scanned     int // tuple versions examined
@@ -55,5 +66,96 @@ type VacuumStats struct {
 // Postgres reference: heap_vacuum_rel() / lazy_scan_prune() in
 // src/backend/access/heap/vacuumlazy.c, HeapTupleSatisfiesVacuum()
 func (db *DB) Vacuum(table string) (VacuumStats, error) {
-	panic("TODO: Problem 11.19")
+	var st VacuumStats
+	if db.closed {
+		return st, ErrClosed
+	}
+	h := db.heaps[table]
+	if h == nil {
+		return st, fmt.Errorf("%w: %q", ErrNoSuchTable, table)
+	}
+	horizon, clog := db.oldestXmin(), db.mgr.Clog
+	indexes := db.indexesOf(table)
+	for pid := types.PageID(0); pid < h.NumPages(); pid++ {
+		f, err := h.pool.FetchPage(pid)
+		if err != nil {
+			return st, err
+		}
+		p := heapPage(f)
+		var dead []types.SlotID
+		allVisible := true
+		var ferr error
+		for slot, data := range p.Tuples() {
+			if slot == lsnSlot {
+				continue
+			}
+			st.Scanned++
+			hdr, err := tuple.DecodeHeader(data)
+			if err != nil {
+				ferr = err
+				break
+			}
+			xmin, xmax := clog.Get(hdr.Xmin), txn.StatusAborted
+			if hdr.Xmax != types.InvalidTxnID {
+				xmax = clog.Get(hdr.Xmax)
+			}
+			isDead := xmin == txn.StatusAborted ||
+				(xmin == txn.StatusCommitted && hdr.Xmax != types.InvalidTxnID &&
+					xmax == txn.StatusCommitted && txn.TxnIDPrecedes(hdr.Xmax, horizon))
+			if !isDead {
+				if xmin != txn.StatusCommitted || !txn.TxnIDPrecedes(hdr.Xmin, horizon) || xmax != txn.StatusAborted {
+					allVisible = false
+				}
+				continue
+			}
+			row, err := tuple.DeformTuple(h.Def.Schema, data)
+			if err != nil {
+				ferr = err
+				break
+			}
+			tid := types.TID{Page: pid, Slot: slot}
+			for _, ix := range indexes {
+				item, err := ix.Entry(row, tid)
+				if err == nil {
+					err = ix.Tree.Delete(item.Key, tid)
+				}
+				if err != nil && !errors.Is(err, btree.ErrNotFound) {
+					ferr = err
+					break
+				}
+			}
+			if ferr != nil {
+				break
+			}
+			dead = append(dead, slot)
+		}
+		if ferr != nil {
+			h.pool.UnpinPage(pid, false)
+			return st, ferr
+		}
+		if len(dead) > 0 {
+			for _, s := range dead {
+				if err := p.DeleteTuple(s); err != nil {
+					h.pool.UnpinPage(pid, true)
+					return st, err
+				}
+			}
+			p.Compact()
+			lsn := db.wal.Append(types.InvalidTxnID, wal.RecUpdate, heapRecord{Op: opPrune, Rel: h.Def.RelID, Page: pid, Slots: dead}.encode())
+			setPageLSN(p, lsn)
+			st.PagesPruned++
+			st.Removed += len(dead)
+		}
+		if allVisible {
+			h.vm[pid] = true
+			st.AllVisible++
+		} else {
+			delete(h.vm, pid)
+		}
+		h.fsm.Update(pid, p.FreeSpace())
+		if err := h.pool.UnpinPage(pid, len(dead) > 0); err != nil {
+			return st, err
+		}
+	}
+	return st, nil
 }

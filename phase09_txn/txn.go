@@ -147,7 +147,20 @@ func (t *Txn) ReleaseSavepoint(name string) error {
 // Constraints: one GetSnapshot per statement under RC, one per transaction under RR.
 // Postgres reference: GetTransactionSnapshot() in src/backend/utils/time/snapmgr.c
 func (t *Txn) StatementSnapshot() *Snapshot {
-	panic("TODO: Problem 9.13")
+	cid := t.NextCid
+	t.NextCid++
+	var snap *Snapshot
+	if t.Level == RepeatableRead {
+		if t.TxnSnap == nil {
+			t.TxnSnap = t.DB.Mgr.GetSnapshot(t.Xid)
+		}
+		cp := *t.TxnSnap
+		snap = &cp
+	} else {
+		snap = t.DB.Mgr.GetSnapshot(t.Xid)
+	}
+	snap.CurCid = cid
+	return snap
 }
 
 // Problem 9.14 — UpdateWhere [Hard]
@@ -189,7 +202,46 @@ func (t *Txn) StatementSnapshot() *Snapshot {
 // Constraints: no goroutines; "waiting" happens only through t.DB.Wait.
 // Postgres reference: ExecUpdate() + EvalPlanQual() in src/backend/executor/nodeModifyTable.c / execMain.c
 func (t *Txn) Update(pred func(types.Row) bool, set func(types.Row) types.Row) (int, error) {
-	panic("TODO: Problem 9.14")
+	snap := t.StatementSnapshot()
+	h, clog, mine, xid := t.DB.Heap, t.DB.Mgr.Clog, t.Mine(), t.WriteXid()
+	n := 0
+	for _, tid := range h.Scan(snap, clog, mine) {
+		if !pred(h.Get(tid).Data) {
+			continue
+		}
+	retry:
+		for {
+			v := h.Get(tid)
+			_, res := h.Update(tid, xid, snap.CurCid, set(v.Data), clog, mine)
+			switch res {
+			case TMOk:
+				n++
+				break retry
+			case TMSelfModified, TMInvisible:
+				break retry
+			case TMBeingModified:
+				blocker := v.Xmax
+				if t.DB.Wait != nil {
+					t.DB.Wait(blocker)
+				}
+				if clog.Get(blocker) == StatusInProgress {
+					return n, ErrWouldBlock
+				}
+			case TMUpdated, TMDeleted:
+				if t.Level == RepeatableRead {
+					return n, ErrSerialization
+				}
+				if res == TMDeleted {
+					break retry
+				}
+				tid = v.Ctid
+				if !pred(h.Get(tid).Data) {
+					break retry
+				}
+			}
+		}
+	}
+	return n, nil
 }
 
 // Problem 9.15 — RollbackTo [Hard]
@@ -231,5 +283,29 @@ func (t *Txn) Update(pred func(types.Row) bool, set func(types.Row) types.Row) (
 // Constraints: O(|Subxids| + |Savepoints|).
 // Postgres reference: RollbackToSavepoint() / AbortSubTransaction() in src/backend/access/transam/xact.c
 func (t *Txn) RollbackTo(name string) error {
-	panic("TODO: Problem 9.15")
+	i := len(t.Savepoints) - 1
+	for i >= 0 && t.Savepoints[i].Name != name {
+		i--
+	}
+	if i < 0 {
+		return ErrNoSavepoint
+	}
+	m := t.DB.Mgr
+	sp := t.Savepoints[i]
+	live := t.Subxids[:0]
+	for _, x := range t.Subxids {
+		if TxnIDPrecedes(x, sp.Xid) {
+			live = append(live, x)
+			continue
+		}
+		_ = m.Clog.Set(x, StatusAborted)
+		delete(m.Running, x)
+	}
+	t.Subxids = live
+	t.Savepoints = t.Savepoints[:i+1]
+	sub := m.Begin()
+	m.Parent[sub] = m.Parent[sp.Xid]
+	t.Savepoints[i].Xid = sub
+	t.Subxids = append(t.Subxids, sub)
+	return nil
 }

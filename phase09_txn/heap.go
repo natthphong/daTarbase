@@ -135,7 +135,54 @@ func (c CurrentXids) Contains(xid types.TxnID) bool {
 // Constraints: O(log |Xip|); only touch v.Hints.
 // Postgres reference: HeapTupleSatisfiesMVCC() in src/backend/access/heap/heapam_visibility.c
 func TupleVisible(v *Version, snap *Snapshot, clog *Clog, mine CurrentXids) bool {
-	panic("TODO: Problem 9.8")
+	switch {
+	case v.Hints&XminFrozen == XminFrozen:
+	case v.Hints&XminInvalid != 0:
+		return false
+	case v.Hints&XminCommitted != 0:
+		if XidInSnapshot(v.Xmin, snap) {
+			return false
+		}
+	case mine.Contains(v.Xmin):
+		if v.Cmin >= snap.CurCid {
+			return false
+		}
+		if v.Xmax == types.InvalidTxnID || !mine.Contains(v.Xmax) {
+			return true
+		}
+		return v.Cmax >= snap.CurCid
+	case XidInSnapshot(v.Xmin, snap):
+		return false
+	default:
+		switch clog.Get(v.Xmin) {
+		case StatusCommitted:
+			v.Hints |= XminCommitted
+		case StatusAborted:
+			v.Hints |= XminInvalid
+			return false
+		default:
+			return false
+		}
+	}
+
+	switch {
+	case v.Xmax == types.InvalidTxnID || v.Hints&XmaxInvalid != 0:
+		return true
+	case v.Hints&XmaxCommitted != 0:
+		return XidInSnapshot(v.Xmax, snap)
+	case mine.Contains(v.Xmax):
+		return v.Cmax >= snap.CurCid
+	case XidInSnapshot(v.Xmax, snap):
+		return true
+	}
+	switch clog.Get(v.Xmax) {
+	case StatusCommitted:
+		v.Hints |= XmaxCommitted
+		return false
+	case StatusAborted:
+		v.Hints |= XmaxInvalid
+	}
+	return true
 }
 
 // Problem 9.9 — Heap.Insert [Easy]
@@ -158,7 +205,9 @@ func TupleVisible(v *Version, snap *Snapshot, clog *Clog, mine CurrentXids) bool
 // Constraints: amortised O(1).
 // Postgres reference: heap_insert() in src/backend/access/heap/heapam.c
 func (h *Heap) Insert(xid types.TxnID, cid CommandID, row types.Row) types.TID {
-	panic("TODO: Problem 9.9")
+	tid := TIDOf(len(h.Versions))
+	h.Versions = append(h.Versions, &Version{Xmin: xid, Cmin: cid, Ctid: tid, Data: row})
+	return tid
 }
 
 // TMResult is the outcome of trying to delete / update / lock a tuple version
@@ -176,6 +225,33 @@ const (
 
 func (r TMResult) String() string {
 	return [...]string{"TM_Ok", "TM_Invisible", "TM_SelfModified", "TM_BeingModified", "TM_Updated", "TM_Deleted"}[r]
+}
+
+// xminStatus is the inserter's status, trusting hint bits first.
+//
+// solution-only
+func xminStatus(v *Version, clog *Clog) TxnStatus {
+	switch {
+	case v.Hints&XminFrozen == XminFrozen, v.Hints&XminCommitted != 0:
+		return StatusCommitted
+	case v.Hints&XminInvalid != 0:
+		return StatusAborted
+	}
+	return clog.Get(v.Xmin)
+}
+
+// xmaxStatus is the deleter's status, trusting hint bits first. A version with
+// no Xmax reports StatusAborted ("nobody deleted it").
+//
+// solution-only
+func xmaxStatus(v *Version, clog *Clog) TxnStatus {
+	switch {
+	case v.Xmax == types.InvalidTxnID, v.Hints&XmaxInvalid != 0:
+		return StatusAborted
+	case v.Hints&XmaxCommitted != 0:
+		return StatusCommitted
+	}
+	return clog.Get(v.Xmax)
 }
 
 // Problem 9.10 — Heap.Delete [Medium]
@@ -215,7 +291,35 @@ func (r TMResult) String() string {
 // Constraints: O(|mine|).
 // Postgres reference: heap_delete() + HeapTupleSatisfiesUpdate() in heapam.c / heapam_visibility.c
 func (h *Heap) Delete(tid types.TID, xid types.TxnID, cid CommandID, clog *Clog, mine CurrentXids) TMResult {
-	panic("TODO: Problem 9.10")
+	v := h.Get(tid)
+	if v == nil {
+		return TMInvisible
+	}
+	if mine.Contains(v.Xmin) {
+		if v.Cmin >= cid {
+			return TMInvisible
+		}
+	} else if xminStatus(v, clog) != StatusCommitted {
+		return TMInvisible
+	}
+	if v.Xmax != types.InvalidTxnID {
+		if mine.Contains(v.Xmax) {
+			return TMSelfModified
+		}
+		switch xmaxStatus(v, clog) {
+		case StatusAborted:
+		case StatusCommitted:
+			if v.Ctid == tid {
+				return TMDeleted
+			}
+			return TMUpdated
+		default:
+			return TMBeingModified
+		}
+	}
+	v.Xmax, v.Cmax = xid, cid
+	v.Hints &^= XmaxCommitted | XmaxInvalid
+	return TMOk
 }
 
 // Problem 9.11 — Heap.Update [Medium]
@@ -241,7 +345,12 @@ func (h *Heap) Delete(tid types.TID, xid types.TxnID, cid CommandID, clog *Clog,
 // Constraints: O(|mine|) amortised.
 // Postgres reference: heap_update() in src/backend/access/heap/heapam.c
 func (h *Heap) Update(tid types.TID, xid types.TxnID, cid CommandID, row types.Row, clog *Clog, mine CurrentXids) (types.TID, TMResult) {
-	panic("TODO: Problem 9.11")
+	if res := h.Delete(tid, xid, cid, clog, mine); res != TMOk {
+		return types.TID{}, res
+	}
+	newTID := h.Insert(xid, cid, row)
+	h.Get(tid).Ctid = newTID
+	return newTID, TMOk
 }
 
 // Problem 9.12 — Heap.Scan [Easy]
@@ -269,5 +378,11 @@ func (h *Heap) Update(tid types.TID, xid types.TxnID, cid CommandID, row types.R
 // Constraints: O(len(h.Versions) · log |Xip|).
 // Postgres reference: heapgettup() / heapgetpage() in src/backend/access/heap/heapam.c
 func (h *Heap) Scan(snap *Snapshot, clog *Clog, mine CurrentXids) []types.TID {
-	panic("TODO: Problem 9.12")
+	out := []types.TID{}
+	for i, v := range h.Versions {
+		if v != nil && TupleVisible(v, snap, clog, mine) {
+			out = append(out, TIDOf(i))
+		}
+	}
+	return out
 }

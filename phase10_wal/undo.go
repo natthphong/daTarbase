@@ -47,5 +47,68 @@ import "github.com/natthphong/daTarbase/pkg/types"
 // Constraints: each record of a txn is read at most once; O(#losers) to pick the next one is fine.
 // Postgres reference: none — Postgres never undoes heap changes (MVCC makes aborted tuples invisible). ARIES section 6.4; Postgres-style undo exists only for sub-structures (e.g. in zheap).
 func (db *DB) Undo(txns ...types.TxnID) error {
-	panic("TODO: Problem 10.13")
+	cursor := map[types.TxnID]types.LSN{}
+	for _, t := range txns {
+		l, ok := db.att[t]
+		if !ok {
+			return ErrNoTxn
+		}
+		cursor[t] = l
+	}
+	for len(cursor) > 0 {
+		var txn types.TxnID
+		var at types.LSN
+		for t, l := range cursor {
+			if l >= at {
+				txn, at = t, l
+			}
+		}
+		if at != InvalidLSN {
+			r, err := db.Log.ReadAt(at)
+			if err != nil {
+				return err
+			}
+			if r.Txn != txn {
+				return ErrBrokenTxnChain
+			}
+			switch r.Type {
+			case RecUpdate:
+				u, err := DecodeUpdate(r.Body)
+				if err != nil {
+					return err
+				}
+				p := db.BP.Page(u.Page)
+				if _, dirty := db.BP.dirty[u.Page]; !dirty {
+					fpi := db.Log.Append(Record{Type: RecFPI, Body: FPIBody{Page: u.Page, Image: p.Data}.Encode()})
+					db.BP.dirty[u.Page] = fpi
+					p.LSN = fpi
+				}
+				clr := db.Log.Append(Record{
+					Type: RecCLR, Txn: txn, PrevLSN: db.att[txn],
+					Body: CLRBody{Page: u.Page, Off: u.Off, Data: u.Before, UndoNext: r.PrevLSN}.Encode(),
+				})
+				copy(p.Data[u.Off:], u.Before)
+				p.LSN = clr
+				db.att[txn] = clr
+				at = r.PrevLSN
+			case RecCLR:
+				c, err := DecodeCLR(r.Body)
+				if err != nil {
+					return err
+				}
+				at = c.UndoNext
+			case RecBegin:
+				at = r.PrevLSN
+			default:
+				return ErrBrokenTxnChain
+			}
+			cursor[txn] = at
+		}
+		if at == InvalidLSN {
+			db.Log.Append(Record{Type: RecAbort, Txn: txn, PrevLSN: db.att[txn]})
+			delete(db.att, txn)
+			delete(cursor, txn)
+		}
+	}
+	return nil
 }

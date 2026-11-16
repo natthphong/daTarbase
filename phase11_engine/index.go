@@ -4,10 +4,11 @@ import (
 	"fmt"
 	"slices"
 
+	tuple "github.com/natthphong/daTarbase/phase01_tuple"
 	btree "github.com/natthphong/daTarbase/phase05_btree"
 	executor "github.com/natthphong/daTarbase/phase06_executor"
 	txn "github.com/natthphong/daTarbase/phase09_txn"
-
+	"github.com/natthphong/daTarbase/pkg/exec"
 	"github.com/natthphong/daTarbase/pkg/types"
 )
 
@@ -101,7 +102,22 @@ func (ix *Index) covers(cols []int) bool {
 // Constraints: two encodings, no other allocation.
 // Postgres reference: FormIndexDatum() in src/backend/catalog/index.c, index_form_tuple() in indextuple.c
 func (ix *Index) Entry(row types.Row, tid types.TID) (btree.Item, error) {
-	panic("TODO: Problem 11.8")
+	vals := make(types.Row, 0, len(ix.KeyCols)+len(ix.InclCols))
+	for _, c := range ix.KeyCols {
+		vals = append(vals, row[c])
+	}
+	key, err := tuple.EncodeKey(vals, nil)
+	if err != nil {
+		return btree.Item{}, err
+	}
+	for _, c := range ix.InclCols {
+		vals = append(vals, row[c])
+	}
+	payload, err := tuple.FormTuple(ix.PayloadSchema, vals, 0)
+	if err != nil {
+		return btree.Item{}, err
+	}
+	return btree.Item{Key: key, TID: tid, Payload: payload}, nil
 }
 
 // Problem 11.9 — Index.Build [Medium]
@@ -137,7 +153,39 @@ func (ix *Index) Entry(row types.Row, tid types.TID) (btree.Item, error) {
 // Constraints: one pass over the heap, one sort, each node written once.
 // Postgres reference: btbuild() / _bt_spools_heapscan() in src/backend/access/nbtree/nbtsort.c
 func (ix *Index) Build() error {
-	panic("TODO: Problem 11.9")
+	h := ix.Heap
+	var items []btree.Item
+	for pid := types.PageID(0); pid < h.NumPages(); pid++ {
+		f, err := h.pool.FetchPage(pid)
+		if err != nil {
+			return err
+		}
+		for slot, data := range heapPage(f).Tuples() {
+			if slot == lsnSlot {
+				continue
+			}
+			row, err := tuple.DeformTuple(h.Def.Schema, data)
+			if err == nil {
+				var it btree.Item
+				it, err = ix.Entry(row, types.TID{Page: pid, Slot: slot})
+				items = append(items, it)
+			}
+			if err != nil {
+				h.pool.UnpinPage(pid, false)
+				return err
+			}
+		}
+		if err := h.pool.UnpinPage(pid, false); err != nil {
+			return err
+		}
+	}
+	slices.SortFunc(items, btree.CompareItems)
+	t, err := btree.BulkLoad(btree.NewNodeStore(), ix.Fanout, items, 0)
+	if err != nil {
+		return err
+	}
+	ix.Tree = t
+	return nil
 }
 
 // Problem 11.11 — KeyBounds [Medium]
@@ -180,7 +228,32 @@ func (ix *Index) Build() error {
 // Postgres reference: _bt_first() strategy handling in src/backend/access/nbtree/nbtsearch.c,
 // make_greater_string() in src/backend/utils/adt/like_support.c
 func KeyBounds(op executor.CmpOp, v types.Value) (lo, hi btree.Bound, err error) {
-	panic("TODO: Problem 11.11")
+	if v.IsNull() {
+		return lo, hi, fmt.Errorf("%w: NULL comparison", ErrBadOperator)
+	}
+	e, err := tuple.EncodeKey(types.Row{v}, nil)
+	if err != nil {
+		return lo, hi, err
+	}
+	succ := slices.Clone(e)
+	for len(succ) > 0 && succ[len(succ)-1] == 0xFF {
+		succ = succ[:len(succ)-1]
+	}
+	succ[len(succ)-1]++
+	nulls := btree.Excl([]byte{tuple.KeyTagNull})
+	switch op {
+	case executor.OpEQ:
+		return btree.Incl(e), btree.Excl(succ), nil
+	case executor.OpLT:
+		return btree.NoBound(), btree.Excl(e), nil
+	case executor.OpLE:
+		return btree.NoBound(), btree.Excl(succ), nil
+	case executor.OpGT:
+		return btree.Incl(succ), nulls, nil
+	case executor.OpGE:
+		return btree.Incl(e), nulls, nil
+	}
+	return lo, hi, fmt.Errorf("%w: %s", ErrBadOperator, op)
 }
 
 // IndexScan returns the heap rows whose index key lies in [Lo, Hi] and that
@@ -244,7 +317,43 @@ func (s *IndexScan) Close() error { s.open, s.cur = false, nil; return nil }
 // Postgres reference: IndexNext() in src/backend/executor/nodeIndexscan.c,
 // heapam_index_fetch_tuple() in heapam_handler.c
 func (s *IndexScan) Next() (types.Row, bool, error) {
-	panic("TODO: Problem 11.12")
+	if !s.open {
+		return nil, false, exec.ErrNotOpen
+	}
+	h := s.Index.Heap
+	for {
+		item, ok := s.cur.Next()
+		if !ok {
+			return nil, false, nil
+		}
+		f, err := h.pool.FetchPage(item.TID.Page)
+		if err != nil {
+			return nil, false, err
+		}
+		s.HeapFetches++
+		data, gerr := heapPage(f).GetTuple(item.TID.Slot)
+		if gerr != nil || item.TID.Slot == lsnSlot {
+			h.pool.UnpinPage(item.TID.Page, false)
+			continue
+		}
+		hdr, err := tuple.DecodeHeader(data)
+		var row types.Row
+		vis := err == nil && Visible(hdr, s.Snap, s.Clog, s.Mine)
+		if vis {
+			row, err = tuple.DeformTuple(h.Def.Schema, data)
+		}
+		h.pool.UnpinPage(item.TID.Page, false)
+		if err != nil {
+			return nil, false, err
+		}
+		if !vis {
+			continue
+		}
+		if s.EmitTID {
+			row = append(row, tidValue(item.TID))
+		}
+		return row, true, nil
+	}
 }
 
 // IndexOnlyScan answers from the index payload alone when the visibility map
@@ -304,5 +413,29 @@ func (s *IndexOnlyScan) Close() error { s.open, s.cur = false, nil; return nil }
 // Constraints: never fetch the heap for an all-visible page.
 // Postgres reference: IndexOnlyNext() in src/backend/executor/nodeIndexonlyscan.c
 func (s *IndexOnlyScan) Next() (types.Row, bool, error) {
-	panic("TODO: Problem 11.13")
+	if !s.open {
+		return nil, false, exec.ErrNotOpen
+	}
+	h := s.Index.Heap
+	for {
+		item, ok := s.cur.Next()
+		if !ok {
+			return nil, false, nil
+		}
+		if !h.vm[item.TID.Page] {
+			s.HeapFetches++
+			hdr, _, live, err := h.fetch(item.TID)
+			if err != nil {
+				return nil, false, err
+			}
+			if !live || !Visible(hdr, s.Snap, s.Clog, s.Mine) {
+				continue
+			}
+		}
+		row, err := tuple.DeformTuple(s.Index.PayloadSchema, item.Payload)
+		if err != nil {
+			return nil, false, err
+		}
+		return row, true, nil
+	}
 }

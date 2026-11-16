@@ -1,6 +1,8 @@
 package sortagg
 
 import (
+	"slices"
+
 	"github.com/natthphong/daTarbase/pkg/exec"
 	"github.com/natthphong/daTarbase/pkg/types"
 )
@@ -61,5 +63,43 @@ func (s *IncrementalSort) Close() error {
 //
 // Postgres reference: ExecIncrementalSort() in src/backend/executor/nodeIncrementalSort.c
 func (s *IncrementalSort) Next() (types.Row, bool, error) {
-	panic("TODO: Problem 7.14")
+	for s.pos >= len(s.buf) {
+		if s.done && !s.hasPend {
+			return nil, false, nil
+		}
+		s.buf, s.pos = s.buf[:0], 0
+		if !s.hasPend {
+			r, ok, err := s.Child.Next()
+			if err != nil {
+				return nil, false, err
+			}
+			if !ok {
+				s.done = true
+				return nil, false, nil
+			}
+			s.pending, s.hasPend = r, true
+		}
+		first := s.pending
+		s.hasPend = false
+		s.buf = append(s.buf, first)
+		for !s.done {
+			r, ok, err := s.Child.Next()
+			if err != nil {
+				return nil, false, err
+			}
+			if !ok {
+				s.done = true
+				break
+			}
+			if CompareRows(first, r, s.Keys[:s.Presorted]) != 0 {
+				s.pending, s.hasPend = r, true
+				break
+			}
+			s.buf = append(s.buf, r)
+		}
+		slices.SortStableFunc(s.buf, func(a, b types.Row) int { return CompareRows(a, b, s.Keys) })
+	}
+	r := s.buf[s.pos]
+	s.pos++
+	return r, true, nil
 }

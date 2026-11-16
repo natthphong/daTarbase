@@ -37,5 +37,48 @@ import (
 // Constraints: exactly one Lookup per outer row with a non-NULL key; never scan the inner.
 // Postgres reference: ExecNestLoop() with nestParams + ExecReScanIndexScan() in src/backend/executor/nodeIndexscan.c
 func IndexNestedLoopJoin(outer exec.Iterator, idx *FakeIndex, spec JoinSpec) ([]types.Row, error) {
-	panic("TODO: Problem 8.12")
+	if spec.Type != Inner && spec.Type != Left {
+		return nil, ErrUnsupportedJoin
+	}
+	if err := outer.Open(); err != nil {
+		return nil, err
+	}
+	var out []types.Row
+	for {
+		o, ok, err := outer.Next()
+		if err != nil {
+			outer.Close()
+			return nil, err
+		}
+		if !ok {
+			break
+		}
+		found := false
+		key := make([]types.Value, len(spec.Keys))
+		hasNull := false
+		for i, k := range spec.Keys {
+			key[i] = o[k.Left]
+			hasNull = hasNull || key[i].IsNull()
+		}
+		if !hasNull {
+			for _, in := range idx.Lookup(key) {
+				m, err := spec.Match(o, in)
+				if err != nil {
+					outer.Close()
+					return nil, err
+				}
+				if m {
+					found = true
+					out = append(out, Concat(o, in))
+				}
+			}
+		}
+		if !found && spec.Type == Left {
+			out = append(out, Concat(o, NullRow(spec.RightWidth)))
+		}
+	}
+	if err := outer.Close(); err != nil {
+		return nil, err
+	}
+	return out, nil
 }

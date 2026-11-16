@@ -45,7 +45,29 @@ package page
 // Postgres reference: PageRepairFragmentation() + compactify_tuples() in src/backend/storage/page/bufpage.c,
 // PageTruncateLinePointerArray() (same file), lazy_vacuum_heap_page() in vacuumlazy.c
 func (p *Page) Compact() int {
-	panic("TODO: Problem 2.9")
+	oldHole := int(p.Upper()) - int(p.Lower())
+	scratch := p.buf // array copy: tuples are read from here, written to p.buf
+
+	n := p.NumSlots()
+	upper := PageSize
+	lastLive := -1
+	for s := 0; s < n; s++ {
+		it, _ := p.ItemID(SlotID(s))
+		if it.Flags != LPNormal {
+			_ = p.SetItemID(SlotID(s), ItemID{})
+			continue
+		}
+		upper -= int(it.Len)
+		copy(p.buf[upper:], scratch[it.Off:int(it.Off)+int(it.Len)])
+		it.Off = uint16(upper)
+		_ = p.SetItemID(SlotID(s), it)
+		lastLive = s
+	}
+	lower := HeaderSize + LinePointerLen*(lastLive+1)
+	clear(p.buf[lower:upper])
+	p.setLower(uint16(lower))
+	p.setUpper(uint16(upper))
+	return (upper - lower) - oldHole
 }
 
 // Problem 2.10 — InsertWithFillFactor [Medium]
@@ -85,5 +107,17 @@ func (p *Page) Compact() int {
 // Postgres reference: RelationGetBufferForTuple() in src/backend/access/heap/hio.c,
 // RelationGetTargetPageFreeSpace in src/include/utils/rel.h
 func (p *Page) InsertWithFillFactor(data []byte, ff int) (SlotID, error) {
-	panic("TODO: Problem 2.10")
+	if ff < 10 || ff > 100 {
+		return 0, ErrBadFillFactor
+	}
+	if len(data) == 0 {
+		return 0, ErrEmptyTuple
+	}
+	if p.NumSlots() > 0 {
+		reserve := PageSize * (100 - ff) / 100
+		if p.FreeSpace()-len(data) < reserve {
+			return 0, ErrPageFull
+		}
+	}
+	return p.InsertTuple(data)
 }

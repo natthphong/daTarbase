@@ -1,6 +1,9 @@
 package engine
 
 import (
+	tuple "github.com/natthphong/daTarbase/phase01_tuple"
+	txn "github.com/natthphong/daTarbase/phase09_txn"
+	wal "github.com/natthphong/daTarbase/phase10_wal"
 	"github.com/natthphong/daTarbase/pkg/types"
 )
 
@@ -51,5 +54,43 @@ import (
 // Postgres reference: heap_delete() in src/backend/access/heap/heapam.c,
 // HeapTupleSatisfiesUpdate() in heapam_visibility.c
 func (h *TableHeap) Delete(t *Txn, tid types.TID) error {
-	panic("TODO: Problem 11.17")
+	if tid.Page >= h.NumPages() || tid.Slot == lsnSlot {
+		return ErrTupleNotFound
+	}
+	f, err := h.pool.FetchPage(tid.Page)
+	if err != nil {
+		return err
+	}
+	p := heapPage(f)
+	data, err := p.GetTuple(tid.Slot)
+	if err != nil {
+		h.pool.UnpinPage(tid.Page, false)
+		return ErrTupleNotFound
+	}
+	fail := func(err error) error { h.pool.UnpinPage(tid.Page, false); return err }
+	hdr, err := tuple.DecodeHeader(data)
+	if err != nil {
+		return fail(err)
+	}
+	clog, mine := t.db.mgr.Clog, t.mine()
+	if !mine.Contains(hdr.Xmin) && clog.Get(hdr.Xmin) != txn.StatusCommitted {
+		return fail(ErrTupleNotFound)
+	}
+	if hdr.Xmax != types.InvalidTxnID {
+		if mine.Contains(hdr.Xmax) {
+			return fail(nil)
+		}
+		switch clog.Get(hdr.Xmax) {
+		case txn.StatusInProgress, txn.StatusSubCommitted:
+			return fail(ErrWriteConflict)
+		case txn.StatusCommitted:
+			return fail(ErrSerialization)
+		}
+	}
+	xid := t.assignXid()
+	setXmax(data, xid)
+	lsn := h.wal.Append(xid, wal.RecUpdate, heapRecord{Op: opDelete, Rel: h.Def.RelID, Page: tid.Page, Slot: tid.Slot, Xmax: xid}.encode())
+	setPageLSN(p, lsn)
+	delete(h.vm, tid.Page)
+	return h.pool.UnpinPage(tid.Page, true)
 }

@@ -1,6 +1,8 @@
 package tuple
 
 import (
+	"sort"
+
 	"github.com/natthphong/daTarbase/pkg/types"
 )
 
@@ -39,5 +41,41 @@ import (
 // Postgres reference: none (Postgres keeps declaration order; see "column
 // tetris" discussions and pg_attribute.attalign).
 func ColumnTetris(schema types.Schema) ([]int, int) {
-	panic("TODO: Problem 1.15")
+	order := make([]int, 0, schema.Len())
+	var texts []int
+	for i, c := range schema.Columns {
+		if AttLen(c.Kind) > 0 {
+			order = append(order, i)
+		} else {
+			texts = append(texts, i)
+		}
+	}
+	sort.SliceStable(order, func(a, b int) bool {
+		return AttAlign(schema.Columns[order[a]].Kind) > AttAlign(schema.Columns[order[b]].Kind)
+	})
+	order = append(order, texts...)
+
+	size := func(cols []types.Column) int {
+		row := make(types.Row, len(cols))
+		for i, c := range cols {
+			switch c.Kind {
+			case types.KindText:
+				row[i] = types.Text("")
+			case types.KindBool:
+				row[i] = types.Bool(true)
+			case types.KindInt32:
+				row[i] = types.Int32(0)
+			case types.KindInt64:
+				row[i] = types.Int64(0)
+			case types.KindFloat64:
+				row[i] = types.Float64(0)
+			}
+		}
+		return ComputeTupleSize(types.Schema{Columns: cols}, row)
+	}
+	reordered := make([]types.Column, len(order))
+	for k, i := range order {
+		reordered[k] = schema.Columns[i]
+	}
+	return order, size(schema.Columns) - size(reordered)
 }

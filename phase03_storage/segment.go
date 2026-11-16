@@ -123,7 +123,7 @@ func (d *SegmentedDisk) Close() error {
 // Constraints: O(1).
 // Postgres reference: _mdfd_getseg() / the RELSEG_SIZE arithmetic in src/backend/storage/smgr/md.c
 func SegmentFor(id types.PageID, segPages uint32) (segNo uint32, off types.PageID) {
-	panic("TODO: Problem 3.4")
+	return uint32(id) / segPages, types.PageID(uint32(id) % segPages)
 }
 
 // Problem 3.5 — SegmentedDisk.Locate [Easy]
@@ -149,7 +149,15 @@ func SegmentFor(id types.PageID, segPages uint32) (segNo uint32, off types.PageI
 // Constraints: O(1), no I/O.
 // Postgres reference: _mdfd_getseg() in src/backend/storage/smgr/md.c
 func (d *SegmentedDisk) Locate(id types.PageID) (*FileDisk, types.PageID, error) {
-	panic("TODO: Problem 3.5")
+	segNo, local := SegmentFor(id, d.segPages)
+	if segNo >= uint32(len(d.segs)) {
+		return nil, 0, ErrPageNotFound
+	}
+	seg := d.segs[segNo]
+	if uint32(local) >= seg.NumPages() {
+		return nil, 0, ErrPageNotFound
+	}
+	return seg, local, nil
 }
 
 // Problem 3.6 — SegmentedDisk.AllocatePage [Medium]
@@ -175,5 +183,25 @@ func (d *SegmentedDisk) Locate(id types.PageID) (*FileDisk, types.PageID, error)
 // Constraints: O(1) besides the file I/O.
 // Postgres reference: mdextend() + _mdfd_openseg() in src/backend/storage/smgr/md.c
 func (d *SegmentedDisk) AllocatePage() (types.PageID, error) {
-	panic("TODO: Problem 3.6")
+	segNo := uint32(len(d.segs) - 1)
+	last := d.segs[segNo]
+	opened := false
+	if last.NumPages() >= d.segPages {
+		fd, err := OpenFileDisk(SegmentPath(d.base, segNo+1))
+		if err != nil {
+			return 0, err
+		}
+		d.segs = append(d.segs, fd)
+		segNo++
+		last, opened = fd, true
+	}
+	local, err := last.AllocatePage()
+	if err != nil {
+		if opened {
+			d.segs = d.segs[:segNo]
+			last.Close()
+		}
+		return 0, err
+	}
+	return types.PageID(segNo*d.segPages + uint32(local)), nil
 }

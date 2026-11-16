@@ -1,5 +1,10 @@
 package page
 
+import (
+	"fmt"
+	"strings"
+)
+
 // Problem 2.15 — Dump [Easy]
 //
 // Render the page header and every line pointer as a human-readable table, like pageinspect.
@@ -41,5 +46,21 @@ package page
 // Constraints: O(PageSize).
 // Postgres reference: heap_page_items() in contrib/pageinspect/heapfuncs.c
 func (p *Page) Dump() string {
-	panic("TODO: Problem 2.15")
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "lower=%d upper=%d free=%d slots=%d\n", p.Lower(), p.Upper(), p.FreeSpace(), p.NumSlots())
+	sb.WriteString(" lp | lp_off | lp_flags   | lp_len | t_data\n")
+	for s := 0; s < p.NumSlots(); s++ {
+		it, _ := p.ItemID(SlotID(s))
+		fmt.Fprintf(&sb, "%3d | %6d | %d %-8s | %6d", s, it.Off, it.Flags, it.Flags.String(), it.Len)
+		if it.Flags == LPNormal {
+			data := p.buf[int(it.Off) : int(it.Off)+int(it.Len)]
+			suffix := ""
+			if len(data) > 8 {
+				data, suffix = data[:8], ".."
+			}
+			fmt.Fprintf(&sb, " | %x%s", data, suffix)
+		}
+		sb.WriteString("\n")
+	}
+	return sb.String()
 }

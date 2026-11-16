@@ -130,7 +130,38 @@ func (b *TIDBitmap) String() string {
 // Constraints: O(log n + k) index reads.
 // Postgres reference: MultiExecBitmapIndexScan() in nodeBitmapIndexscan.c, tbm_lossify() in tidbitmap.c
 func BitmapIndexScan(ix *Index, r KeyRange, maxExact int) *TIDBitmap {
-	panic("TODO: Problem 6.8")
+	b := NewTIDBitmap()
+	pos := 0
+	if lo := r.Lo; lo != nil {
+		pos = sort.Search(ix.Len(), func(i int) bool {
+			c := types.Compare(ix.At(i).Key, lo.Val)
+			return c > 0 || (c == 0 && lo.Inclusive)
+		})
+	}
+	for ; pos < ix.Len(); pos++ {
+		e := ix.At(pos)
+		if hi := r.Hi; hi != nil {
+			c := types.Compare(e.Key, hi.Val)
+			if c > 0 || (c == 0 && !hi.Inclusive) {
+				break
+			}
+		}
+		b.Add(e.TID)
+	}
+	if maxExact <= 0 {
+		return b
+	}
+	for b.ExactTuples() > maxExact {
+		best, bestN := types.PageID(0), -1
+		for _, p := range b.PageIDs() {
+			pb := b.Pages[p]
+			if !pb.Lossy && len(pb.Slots) > bestN {
+				best, bestN = p, len(pb.Slots)
+			}
+		}
+		b.MarkLossy(best)
+	}
+	return b
 }
 
 // BitmapOp selects how BitmapCombine merges two bitmaps.
@@ -173,7 +204,66 @@ const (
 // Constraints: O(total entries).
 // Postgres reference: tbm_intersect() / tbm_union() in src/backend/nodes/tidbitmap.c
 func BitmapCombine(op BitmapOp, a, b *TIDBitmap) *TIDBitmap {
-	panic("TODO: Problem 6.9")
+	out := NewTIDBitmap()
+	copyEntry := func(pb *PageBits) *PageBits {
+		if pb.Lossy {
+			return &PageBits{Lossy: true}
+		}
+		c := &PageBits{Recheck: pb.Recheck, Slots: make(map[types.SlotID]struct{}, len(pb.Slots))}
+		for s := range pb.Slots {
+			c.Slots[s] = struct{}{}
+		}
+		return c
+	}
+	if op == BitmapOr {
+		for p, pa := range a.Pages {
+			out.Pages[p] = copyEntry(pa)
+		}
+		for p, pbb := range b.Pages {
+			cur := out.Pages[p]
+			switch {
+			case cur == nil:
+				out.Pages[p] = copyEntry(pbb)
+			case cur.Lossy || pbb.Lossy:
+				out.Pages[p] = &PageBits{Lossy: true}
+			default:
+				for s := range pbb.Slots {
+					cur.Slots[s] = struct{}{}
+				}
+				cur.Recheck = cur.Recheck || pbb.Recheck
+			}
+		}
+		return out
+	}
+	for p, pa := range a.Pages {
+		pbb := b.Pages[p]
+		if pbb == nil {
+			continue
+		}
+		switch {
+		case pa.Lossy && pbb.Lossy:
+			out.Pages[p] = &PageBits{Lossy: true}
+		case pa.Lossy:
+			c := copyEntry(pbb)
+			c.Recheck = true
+			out.Pages[p] = c
+		case pbb.Lossy:
+			c := copyEntry(pa)
+			c.Recheck = true
+			out.Pages[p] = c
+		default:
+			c := &PageBits{Recheck: pa.Recheck || pbb.Recheck, Slots: map[types.SlotID]struct{}{}}
+			for s := range pa.Slots {
+				if _, ok := pbb.Slots[s]; ok {
+					c.Slots[s] = struct{}{}
+				}
+			}
+			if len(c.Slots) > 0 {
+				out.Pages[p] = c
+			}
+		}
+	}
+	return out
 }
 
 // BitmapHeapScan visits the heap pages of a TID bitmap in physical order
@@ -229,5 +319,48 @@ func (s *BitmapHeapScan) Close() error { s.cur, s.todo, s.pages = nil, nil, nil;
 // Constraints: one ReadPage per bitmap page.
 // Postgres reference: BitmapHeapNext() in src/backend/executor/nodeBitmapHeapscan.c
 func (s *BitmapHeapScan) Next() (types.Row, bool, error) {
-	panic("TODO: Problem 6.10")
+	for {
+		for len(s.todo) > 0 {
+			slot := s.todo[0]
+			s.todo = s.todo[1:]
+			if int(slot) >= len(s.cur) || s.cur[slot] == nil {
+				continue
+			}
+			row := s.cur[slot]
+			if s.check && s.Qual != nil {
+				v, err := Eval(s.Qual, row)
+				if err != nil {
+					return nil, false, err
+				}
+				if v.Kind != types.KindBool && v.Kind != types.KindNull {
+					return nil, false, ErrTypeMismatch
+				}
+				if v.IsNull() || !v.B {
+					s.RowsRemovedByRecheck++
+					continue
+				}
+			}
+			return row, true, nil
+		}
+		if len(s.pages) == 0 {
+			return nil, false, nil
+		}
+		p := s.pages[0]
+		s.pages = s.pages[1:]
+		if int(p) >= s.Table.NumPages() {
+			continue
+		}
+		pb := s.Bitmap.Pages[p]
+		s.cur = s.Table.ReadPage(p)
+		if pb.Lossy {
+			s.todo = make([]types.SlotID, len(s.cur))
+			for i := range s.cur {
+				s.todo[i] = types.SlotID(i)
+			}
+			s.check = true
+		} else {
+			s.todo = s.Bitmap.SlotsOf(p)
+			s.check = pb.Recheck
+		}
+	}
 }

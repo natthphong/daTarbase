@@ -63,7 +63,17 @@ func (f *FSM) Len() int { return len(f.cats) }
 // Postgres reference: fsm_space_avail_to_cat() and RecordPageWithFreeSpace()
 // in src/backend/storage/freespace/freespace.c
 func (f *FSM) Update(page types.PageID, free int) {
-	panic("TODO: Problem 4.1")
+	cat := 0
+	if free > 0 {
+		cat = free / FSMCatStep
+	}
+	if cat > MaxCategory {
+		cat = MaxCategory
+	}
+	for len(f.cats) <= int(page) {
+		f.cats = append(f.cats, 0)
+	}
+	f.cats[page] = uint8(cat)
 }
 
 // Problem 4.2 — FSMSearch [Easy]
@@ -96,7 +106,19 @@ func (f *FSM) Update(page types.PageID, free int) {
 // Postgres reference: fsm_space_needed_to_cat() and GetPageWithFreeSpace()
 // in src/backend/storage/freespace/freespace.c
 func (f *FSM) Search(need int) types.PageID {
-	panic("TODO: Problem 4.2")
+	if need < 1 {
+		need = 1
+	}
+	cat := (need + FSMCatStep - 1) / FSMCatStep
+	if cat > MaxCategory {
+		return types.InvalidPageID
+	}
+	for p, c := range f.cats {
+		if int(c) >= cat {
+			return types.PageID(p)
+		}
+	}
+	return types.InvalidPageID
 }
 
 // FSMTree is the shape of a real Postgres FSM page: a complete binary
@@ -160,7 +182,16 @@ func (t *FSMTree) Nodes() []uint8 { return t.nodes }
 // Constraints: O(log n) — touch only the leaf-to-root path.
 // Postgres reference: fsm_set_avail() in src/backend/storage/freespace/fsmpage.c
 func (t *FSMTree) Set(page types.PageID, cat uint8) error {
-	panic("TODO: Problem 4.3")
+	if uint64(page) >= uint64(t.nleaves) {
+		return ErrPageOutOfRange
+	}
+	i := t.nleaves - 1 + int(page)
+	t.nodes[i] = cat
+	for i > 0 {
+		i = (i - 1) / 2
+		t.nodes[i] = max(t.nodes[2*i+1], t.nodes[2*i+2])
+	}
+	return nil
 }
 
 // Problem 4.4 — FSMTreeSearch [Hard]
@@ -200,5 +231,34 @@ func (t *FSMTree) Set(page types.PageID, cat uint8) error {
 // Postgres reference: fsm_search_avail() in src/backend/storage/freespace/fsmpage.c
 // (Postgres uses an approximate "move right and climb up" walk instead.)
 func (t *FSMTree) Search(minCat uint8, start types.PageID) types.PageID {
-	panic("TODO: Problem 4.4")
+	if uint64(start) >= uint64(t.nleaves) {
+		start = 0
+	}
+	if t.nodes[0] < minCat {
+		return types.InvalidPageID
+	}
+	// find returns the leftmost leaf index in [lo, hi] (page numbers) under
+	// `node` (which covers pages [nlo, nhi]) with value >= minCat, or -1.
+	var find func(node, nlo, nhi, lo, hi int) int
+	find = func(node, nlo, nhi, lo, hi int) int {
+		if nhi < lo || nlo > hi || t.nodes[node] < minCat {
+			return -1
+		}
+		if nlo == nhi {
+			return nlo
+		}
+		mid := (nlo + nhi) / 2
+		if r := find(2*node+1, nlo, mid, lo, hi); r >= 0 {
+			return r
+		}
+		return find(2*node+2, mid+1, nhi, lo, hi)
+	}
+	s := int(start)
+	if r := find(0, 0, t.nleaves-1, s, t.nleaves-1); r >= 0 {
+		return types.PageID(r)
+	}
+	if r := find(0, 0, t.nleaves-1, 0, s-1); r >= 0 {
+		return types.PageID(r)
+	}
+	return types.InvalidPageID
 }

@@ -41,7 +41,40 @@ import "github.com/natthphong/daTarbase/pkg/types"
 // Constraints: one pass over the heap plus one pass to fix Ctids.
 // Postgres reference: heap_page_prune() / HeapTupleSatisfiesVacuum() in src/backend/access/heap/pruneheap.c, heapam_visibility.c
 func Vacuum(h *Heap, clog *Clog, oldestXmin types.TxnID) int {
-	panic("TODO: Problem 9.20")
+	removed := 0
+	for i, v := range h.Versions {
+		if v == nil {
+			continue
+		}
+		xs := xminStatus(v, clog)
+		var xm TxnStatus = StatusInProgress
+		if v.Xmax != types.InvalidTxnID {
+			xm = xmaxStatus(v, clog)
+		}
+		if xs == StatusAborted ||
+			(xs == StatusCommitted && v.Xmax != types.InvalidTxnID && xm == StatusCommitted && TxnIDPrecedes(v.Xmax, oldestXmin)) {
+			h.Versions[i] = nil
+			removed++
+			continue
+		}
+		if xs == StatusCommitted {
+			v.Hints |= XminCommitted
+		}
+		if v.Xmax != types.InvalidTxnID {
+			switch xm {
+			case StatusCommitted:
+				v.Hints |= XmaxCommitted
+			case StatusAborted:
+				v.Hints |= XmaxInvalid
+			}
+		}
+	}
+	for i, v := range h.Versions {
+		if v != nil && h.Get(v.Ctid) == nil {
+			v.Ctid = TIDOf(i)
+		}
+	}
+	return removed
 }
 
 // Problem 9.21 — Freeze [Medium]
@@ -80,5 +113,20 @@ func Vacuum(h *Heap, clog *Clog, oldestXmin types.TxnID) int {
 // Constraints: one pass.
 // Postgres reference: heap_prepare_freeze_tuple() / heap_freeze_execute_prepared() in src/backend/access/heap/heapam.c
 func Freeze(h *Heap, clog *Clog, cutoff types.TxnID) int {
-	panic("TODO: Problem 9.21")
+	frozen := 0
+	for _, v := range h.Versions {
+		if v == nil {
+			continue
+		}
+		if IsNormal(v.Xmax) && xmaxStatus(v, clog) == StatusAborted && TxnIDPrecedes(v.Xmax, cutoff) {
+			v.Xmax, v.Cmax = types.InvalidTxnID, 0
+			v.Hints = v.Hints&^XmaxCommitted | XmaxInvalid
+		}
+		if IsNormal(v.Xmin) && v.Hints&XminFrozen != XminFrozen &&
+			xminStatus(v, clog) == StatusCommitted && TxnIDPrecedes(v.Xmin, cutoff) {
+			v.Hints |= XminFrozen
+			frozen++
+		}
+	}
+	return frozen
 }

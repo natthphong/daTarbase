@@ -63,7 +63,30 @@ func NewTupleDesc(s types.Schema) *TupleDesc {
 //
 // Postgres reference: heap_compute_data_size() in src/backend/access/common/heaptuple.c
 func ComputeTupleSize(schema types.Schema, row types.Row) int {
-	panic("TODO: Problem 1.10")
+	bitmap := 0
+	for _, v := range row {
+		if v.IsNull() {
+			bitmap = BitmapLen(len(row))
+			break
+		}
+	}
+	off := AlignUp(HeaderSize+bitmap, 8)
+	for i, v := range row {
+		if v.IsNull() {
+			continue
+		}
+		k := schema.Columns[i].Kind
+		if k != types.KindText {
+			off = AlignUp(off, AttAlign(k)) + AttLen(k)
+			continue
+		}
+		if 1+len(v.S) <= VarlenaShortMax {
+			off += 1 + len(v.S)
+		} else {
+			off = AlignUp(off, AttAlign(k)) + VarlenaLongHdr + len(v.S)
+		}
+	}
+	return off
 }
 
 // Problem 1.11 — FormTuple [Hard]
@@ -103,7 +126,79 @@ func ComputeTupleSize(schema types.Schema, row types.Row) int {
 // Constraints: allocate the output once (size it with ComputeTupleSize).
 // Postgres reference: heap_form_tuple() / heap_fill_tuple() in src/backend/access/common/heaptuple.c
 func FormTuple(schema types.Schema, row types.Row, xmin types.TxnID) ([]byte, error) {
-	panic("TODO: Problem 1.11")
+	if len(row) != schema.Len() {
+		return nil, ErrArity
+	}
+	var mask uint16
+	for i, v := range row {
+		col := schema.Columns[i]
+		if v.IsNull() {
+			if col.NotNull {
+				return nil, ErrNotNull
+			}
+			mask |= HeapHasNull
+			continue
+		}
+		if v.Kind != col.Kind {
+			return nil, ErrTypeMismatch
+		}
+		if v.Kind == types.KindText {
+			mask |= HeapHasVarWidth
+		}
+	}
+	bitmap := NullBitmap(row)
+	hoff := AlignUp(HeaderSize+len(bitmap), 8)
+	buf := make([]byte, 0, ComputeTupleSize(schema, row))
+	buf = AppendHeader(buf, TupleHeader{Xmin: xmin, Infomask: mask, Natts: uint16(len(row)), Hoff: uint8(hoff)})
+	buf = append(buf, bitmap...)
+	pad := func(to int) {
+		for len(buf) < to {
+			buf = append(buf, 0)
+		}
+	}
+	pad(hoff)
+	for _, v := range row {
+		switch {
+		case v.IsNull():
+		case v.Kind == types.KindText:
+			if 1+len(v.S) > VarlenaShortMax {
+				pad(AlignUp(len(buf), AttAlign(v.Kind)))
+			}
+			buf = AppendVarlena(buf, v.S)
+		default:
+			pad(AlignUp(len(buf), AttAlign(v.Kind)))
+			buf, _ = AppendFixed(buf, v)
+		}
+	}
+	return buf, nil
+}
+
+// readAttr decodes one non-NULL attribute of the given kind starting at off,
+// skipping alignment padding first. It returns the value and the offset just
+// past it. solution-only
+func readAttr(data []byte, kind types.Kind, off int) (types.Value, int, error) {
+	if kind == types.KindText {
+		if off < len(data) && data[off] == 0 {
+			off = AlignUp(off, AttAlign(kind))
+		}
+		if off >= len(data) {
+			return types.Value{}, 0, ErrCorrupt
+		}
+		s, n, err := DecodeVarlena(data[off:])
+		if err != nil {
+			return types.Value{}, 0, ErrCorrupt
+		}
+		return types.Text(s), off + n, nil
+	}
+	off = AlignUp(off, AttAlign(kind))
+	if off > len(data) {
+		return types.Value{}, 0, ErrCorrupt
+	}
+	v, err := DecodeFixed(kind, data[off:])
+	if err != nil {
+		return types.Value{}, 0, ErrCorrupt
+	}
+	return v, off + AttLen(kind), nil
 }
 
 // Problem 1.12 — DeformTuple [Hard]
@@ -144,7 +239,31 @@ func FormTuple(schema types.Schema, row types.Row, xmin types.TxnID) ([]byte, er
 // Postgres reference: heap_deform_tuple() in src/backend/access/common/heaptuple.c,
 // att_align_pointer() in src/include/access/tupmacs.h
 func DeformTuple(schema types.Schema, data []byte) (types.Row, error) {
-	panic("TODO: Problem 1.12")
+	h, err := DecodeHeader(data)
+	if err != nil {
+		return nil, err
+	}
+	natts := int(h.Natts)
+	if natts > schema.Len() {
+		return nil, ErrCorrupt
+	}
+	var bitmap []byte
+	if h.Infomask&HeapHasNull != 0 {
+		bitmap = data[HeaderSize : HeaderSize+BitmapLen(natts)]
+	}
+	row := make(types.Row, schema.Len())
+	off := int(h.Hoff)
+	for i := range row {
+		if i >= natts || AttIsNull(bitmap, i) {
+			row[i] = types.Null()
+			continue
+		}
+		row[i], off, err = readAttr(data, schema.Columns[i].Kind, off)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return row, nil
 }
 
 // Problem 1.13 — GetAttr [Medium]
@@ -185,5 +304,61 @@ func DeformTuple(schema types.Schema, data []byte) (types.Row, error) {
 // Constraints: the fast path must not look at any column other than col.
 // Postgres reference: nocachegetattr() in src/backend/access/common/heaptuple.c
 func (td *TupleDesc) GetAttr(data []byte, col int) (types.Value, error) {
-	panic("TODO: Problem 1.13")
+	cols := td.Schema.Columns
+	if col < 0 || col >= len(cols) {
+		return types.Value{}, ErrBadAttnum
+	}
+	td.AttCacheOff[0] = 0
+	for j := 1; j <= col; j++ {
+		if AttLen(cols[j-1].Kind) <= 0 || AttLen(cols[j].Kind) <= 0 || td.AttCacheOff[j-1] < 0 {
+			break
+		}
+		td.AttCacheOff[j] = AlignUp(td.AttCacheOff[j-1]+AttLen(cols[j-1].Kind), AttAlign(cols[j].Kind))
+	}
+	h, err := DecodeHeader(data)
+	if err != nil {
+		return types.Value{}, err
+	}
+	natts := int(h.Natts)
+	if natts > len(cols) {
+		return types.Value{}, ErrCorrupt
+	}
+	if col >= natts {
+		return types.Null(), nil
+	}
+	var bitmap []byte
+	if h.Infomask&HeapHasNull != 0 {
+		bitmap = data[HeaderSize : HeaderSize+BitmapLen(natts)]
+	}
+	if AttIsNull(bitmap, col) {
+		return types.Null(), nil
+	}
+	nullBefore := false
+	for j := 0; j < col && len(bitmap) > 0; j++ {
+		if AttIsNull(bitmap, j) {
+			nullBefore = true
+			break
+		}
+	}
+	if td.AttCacheOff[col] >= 0 && !nullBefore {
+		td.Stats.FastPath++
+		v, _, err := readAttr(data, cols[col].Kind, int(h.Hoff)+td.AttCacheOff[col])
+		return v, err
+	}
+	td.Stats.SlowPath++
+	off := int(h.Hoff)
+	for j := 0; j <= col; j++ {
+		if AttIsNull(bitmap, j) {
+			continue
+		}
+		var v types.Value
+		v, off, err = readAttr(data, cols[j].Kind, off)
+		if err != nil {
+			return types.Value{}, err
+		}
+		if j == col {
+			return v, nil
+		}
+	}
+	return types.Value{}, ErrCorrupt
 }

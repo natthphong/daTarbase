@@ -1,6 +1,8 @@
 package btree
 
 import (
+	"slices"
+
 	"github.com/natthphong/daTarbase/pkg/types"
 )
 
@@ -31,7 +33,16 @@ import (
 // Constraints: exactly Height reads, at most 1 write.
 // Postgres reference: btbulkdelete() / _bt_delitems_vacuum() in src/backend/access/nbtree/nbtree.c, nbtpage.c
 func (t *Tree) RemoveEntry(key []byte, tid types.TID) ([]Step, error) {
-	panic("TODO: Problem 5.15")
+	probe := Item{Key: key, TID: tid}
+	path := t.Descend(probe)
+	s := path[len(path)-1]
+	n := s.Node
+	if s.Pos >= len(n.Items) || CompareItems(n.Items[s.Pos], probe) != 0 {
+		return nil, ErrNotFound
+	}
+	n.Items = slices.Delete(n.Items, s.Pos, s.Pos+1)
+	t.Store.Put(n)
+	return path, nil
 }
 
 // Problem 5.16 — Borrow [Medium]
@@ -76,7 +87,51 @@ func (t *Tree) RemoveEntry(key []byte, tid types.TID) ([]Step, error) {
 // Postgres reference: none — Postgres never borrows; it only deletes empty
 // pages (_bt_pagedel in nbtpage.c). This is the textbook B+Tree rebalance.
 func (t *Tree) Borrow(parent *Node, idx int) bool {
-	panic("TODO: Problem 5.16")
+	min := t.MinItems()
+	child := t.Store.Get(parent.Children[idx])
+	if idx > 0 {
+		left := t.Store.Get(parent.Children[idx-1])
+		if len(left.Items) > min {
+			last := len(left.Items) - 1
+			if child.Leaf {
+				child.Items = slices.Insert(child.Items, 0, left.Items[last])
+				first := child.Items[0]
+				parent.Items[idx-1] = Item{Key: first.Key, TID: first.TID}
+			} else {
+				child.Items = slices.Insert(child.Items, 0, parent.Items[idx-1])
+				child.Children = slices.Insert(child.Children, 0, left.Children[last+1])
+				parent.Items[idx-1] = left.Items[last]
+				left.Children = left.Children[:last+1]
+			}
+			left.Items = left.Items[:last]
+			t.Store.Put(left)
+			t.Store.Put(child)
+			t.Store.Put(parent)
+			return true
+		}
+	}
+	if idx+1 < len(parent.Children) {
+		right := t.Store.Get(parent.Children[idx+1])
+		if len(right.Items) > min {
+			if child.Leaf {
+				child.Items = append(child.Items, right.Items[0])
+				right.Items = slices.Delete(right.Items, 0, 1)
+				first := right.Items[0]
+				parent.Items[idx] = Item{Key: first.Key, TID: first.TID}
+			} else {
+				child.Items = append(child.Items, parent.Items[idx])
+				child.Children = append(child.Children, right.Children[0])
+				parent.Items[idx] = right.Items[0]
+				right.Items = slices.Delete(right.Items, 0, 1)
+				right.Children = slices.Delete(right.Children, 0, 1)
+			}
+			t.Store.Put(right)
+			t.Store.Put(child)
+			t.Store.Put(parent)
+			return true
+		}
+	}
+	return false
 }
 
 // Problem 5.17 — Merge [Medium]
@@ -110,7 +165,29 @@ func (t *Tree) Borrow(parent *Node, idx int) bool {
 // Postgres reference: none — Postgres unlinks empty pages instead
 // (_bt_unlink_halfdead_page in nbtpage.c).
 func (t *Tree) Merge(parent *Node, idx int) {
-	panic("TODO: Problem 5.17")
+	l, r := idx-1, idx
+	if idx == 0 {
+		l, r = 0, 1
+	}
+	left := t.Store.Get(parent.Children[l])
+	right := t.Store.Get(parent.Children[r])
+	if left.Leaf {
+		left.Items = append(left.Items, right.Items...)
+		left.Next = right.Next
+		if right.Next != types.InvalidPageID {
+			nx := t.Store.Get(right.Next)
+			nx.Prev = left.ID
+			t.Store.Put(nx)
+		}
+	} else {
+		left.Items = append(append(left.Items, parent.Items[l]), right.Items...)
+		left.Children = append(left.Children, right.Children...)
+	}
+	parent.Items = slices.Delete(parent.Items, l, l+1)
+	parent.Children = slices.Delete(parent.Children, r, r+1)
+	t.Store.Put(left)
+	t.Store.Free(right.ID)
+	t.Store.Put(parent)
 }
 
 // Problem 5.18 — Delete [Hard]
@@ -146,5 +223,25 @@ func (t *Tree) Merge(parent *Node, idx int) {
 // Postgres reference: btbulkdelete() + _bt_pagedel() in src/backend/access/nbtree/nbtpage.c
 // (Postgres only removes completely empty pages; it does not merge).
 func (t *Tree) Delete(key []byte, tid types.TID) error {
-	panic("TODO: Problem 5.18")
+	path, err := t.RemoveEntry(key, tid)
+	if err != nil {
+		return err
+	}
+	for lvl := len(path) - 1; lvl >= 1; lvl-- {
+		if len(path[lvl].Node.Items) >= t.MinItems() {
+			break
+		}
+		p := path[lvl-1]
+		if t.Borrow(p.Node, p.Pos) {
+			break
+		}
+		t.Merge(p.Node, p.Pos)
+	}
+	root := path[0].Node
+	if !root.Leaf && len(root.Items) == 0 {
+		t.Root = root.Children[0]
+		t.Store.Free(root.ID)
+		t.Height--
+	}
+	return nil
 }

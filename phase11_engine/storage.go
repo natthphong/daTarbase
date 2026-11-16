@@ -10,7 +10,7 @@ import (
 	page "github.com/natthphong/daTarbase/phase02_page"
 	storage "github.com/natthphong/daTarbase/phase03_storage"
 	heap "github.com/natthphong/daTarbase/phase04_heap"
-
+	wal "github.com/natthphong/daTarbase/phase10_wal"
 	"github.com/natthphong/daTarbase/pkg/types"
 )
 
@@ -274,5 +274,35 @@ func valueTID(v types.Value) types.TID {
 // Postgres reference: heap_insert() in src/backend/access/heap/heapam.c,
 // RelationGetBufferForTuple() in hio.c
 func (h *TableHeap) Insert(xid types.TxnID, row types.Row) (types.TID, error) {
-	panic("TODO: Problem 11.4")
+	data, err := tuple.FormTuple(h.Def.Schema, row, xid)
+	if err != nil {
+		return types.TID{}, err
+	}
+	if len(data) > MaxTupleLen {
+		return types.TID{}, ErrTupleTooLarge
+	}
+	var f *storage.Frame
+	if pid := h.fsm.Search(len(data)); pid != types.InvalidPageID {
+		f, err = h.pool.FetchPage(pid)
+	} else {
+		f, err = h.pool.NewPage()
+	}
+	if err != nil {
+		return types.TID{}, err
+	}
+	pid := f.PageID
+	p := heapPage(f)
+	slot, err := p.InsertTuple(data)
+	if err != nil {
+		h.pool.UnpinPage(pid, false)
+		return types.TID{}, err
+	}
+	lsn := h.wal.Append(xid, wal.RecUpdate, heapRecord{Op: opInsert, Rel: h.Def.RelID, Page: pid, Slot: slot, Tuple: data}.encode())
+	setPageLSN(p, lsn)
+	delete(h.vm, pid)
+	h.fsm.Update(pid, p.FreeSpace())
+	if err := h.pool.UnpinPage(pid, true); err != nil {
+		return types.TID{}, err
+	}
+	return types.TID{Page: pid, Slot: slot}, nil
 }

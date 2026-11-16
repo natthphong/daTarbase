@@ -252,5 +252,17 @@ func (ix *FakeIndex) Lookup(key []types.Value) []types.Row {
 // Constraints: O(len(Keys)) + one Extra call at most.
 // Postgres reference: ExecQual() on joinqual/otherqual in src/backend/executor/nodeNestloop.c
 func (s JoinSpec) Match(left, right types.Row) (bool, error) {
-	panic("TODO: Problem 8.1")
+	for _, k := range s.Keys {
+		a, b := left[k.Left], right[k.Right]
+		if a.IsNull() || b.IsNull() {
+			return false, nil
+		}
+		if types.Compare(a, b) != 0 {
+			return false, nil
+		}
+	}
+	if s.Extra == nil {
+		return true, nil
+	}
+	return s.Extra(Concat(left, right))
 }

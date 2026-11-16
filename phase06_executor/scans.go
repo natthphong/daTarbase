@@ -1,6 +1,8 @@
 package executor
 
 import (
+	"sort"
+
 	"github.com/natthphong/daTarbase/pkg/types"
 )
 
@@ -53,7 +55,34 @@ func (s *SeqScan) Close() error { s.slots = nil; return nil }
 // Constraints: O(1) extra memory besides the current page.
 // Postgres reference: SeqNext() in src/backend/executor/nodeSeqscan.c, heapgettup_pagemode() in heapam.c
 func (s *SeqScan) Next() (types.Row, bool, error) {
-	panic("TODO: Problem 6.5")
+	for {
+		for s.slot < len(s.slots) {
+			r := s.slots[s.slot]
+			s.slot++
+			if r == nil {
+				continue
+			}
+			if s.Qual != nil {
+				v, err := Eval(s.Qual, r)
+				if err != nil {
+					return nil, false, err
+				}
+				if v.Kind != types.KindBool && v.Kind != types.KindNull {
+					return nil, false, ErrTypeMismatch
+				}
+				if v.IsNull() || !v.B {
+					s.RowsRemoved++
+					continue
+				}
+			}
+			return r, true, nil
+		}
+		if s.page >= s.Table.NumPages() {
+			return nil, false, nil
+		}
+		s.slots, s.slot = s.Table.ReadPage(types.PageID(s.page)), 0
+		s.page++
+	}
 }
 
 // IndexScan walks an index range and fetches each matching row from the heap
@@ -104,7 +133,47 @@ func (s *IndexScan) Close() error { return nil }
 // Constraints: O(log n + k) index reads for k matching entries.
 // Postgres reference: IndexNext() in src/backend/executor/nodeIndexscan.c, _bt_first() in nbtsearch.c
 func (s *IndexScan) Next() (types.Row, bool, error) {
-	panic("TODO: Problem 6.6")
+	if s.done {
+		return nil, false, nil
+	}
+	if !s.started {
+		s.started = true
+		if lo := s.Range.Lo; lo != nil {
+			s.pos = sort.Search(s.Index.Len(), func(i int) bool {
+				c := types.Compare(s.Index.At(i).Key, lo.Val)
+				return c > 0 || (c == 0 && lo.Inclusive)
+			})
+		}
+	}
+	for s.pos < s.Index.Len() {
+		e := s.Index.At(s.pos)
+		if hi := s.Range.Hi; hi != nil {
+			c := types.Compare(e.Key, hi.Val)
+			if c > 0 || (c == 0 && !hi.Inclusive) {
+				break
+			}
+		}
+		s.pos++
+		row, ok := s.Table.Fetch(e.TID)
+		if !ok {
+			continue
+		}
+		if s.Qual != nil {
+			v, err := Eval(s.Qual, row)
+			if err != nil {
+				return nil, false, err
+			}
+			if v.Kind != types.KindBool && v.Kind != types.KindNull {
+				return nil, false, ErrTypeMismatch
+			}
+			if v.IsNull() || !v.B {
+				continue
+			}
+		}
+		return row, true, nil
+	}
+	s.done = true
+	return nil, false, nil
 }
 
 // IndexOnlyScan answers a query from the index alone when the visibility map
@@ -159,5 +228,35 @@ func (s *IndexOnlyScan) Close() error { return nil }
 // Constraints: O(log n + k) index reads; no heap access for all-visible pages.
 // Postgres reference: IndexOnlyNext() in src/backend/executor/nodeIndexonlyscan.c
 func (s *IndexOnlyScan) Next() (types.Row, bool, error) {
-	panic("TODO: Problem 6.7")
+	if s.done {
+		return nil, false, nil
+	}
+	if !s.started {
+		s.started = true
+		if lo := s.Range.Lo; lo != nil {
+			s.pos = sort.Search(s.Index.Len(), func(i int) bool {
+				c := types.Compare(s.Index.At(i).Key, lo.Val)
+				return c > 0 || (c == 0 && lo.Inclusive)
+			})
+		}
+	}
+	for s.pos < s.Index.Len() {
+		e := s.Index.At(s.pos)
+		if hi := s.Range.Hi; hi != nil {
+			c := types.Compare(e.Key, hi.Val)
+			if c > 0 || (c == 0 && !hi.Inclusive) {
+				break
+			}
+		}
+		s.pos++
+		if !s.VM.AllVisible(e.TID.Page) {
+			s.HeapFetches++
+			if _, ok := s.Table.Fetch(e.TID); !ok {
+				continue
+			}
+		}
+		return types.Row{e.Key}, true, nil
+	}
+	s.done = true
+	return nil, false, nil
 }

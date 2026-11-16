@@ -48,7 +48,69 @@ import (
 // Constraints: O(|left| + |right| + output) expected time, each input read once.
 // Postgres reference: ExecHashJoin() (ExecHashJoinImpl) in src/backend/executor/nodeHashjoin.c, MultiExecHash() in nodeHash.c
 func HashJoinInner(left, right exec.Iterator, spec JoinSpec) ([]types.Row, error) {
-	panic("TODO: Problem 8.7")
+	if spec.Type != Inner {
+		return nil, ErrUnsupportedJoin
+	}
+	rcols, lcols := spec.RightCols(), spec.LeftCols()
+	if err := right.Open(); err != nil {
+		return nil, err
+	}
+	table := map[string][]types.Row{}
+	inserted := 0
+	for {
+		r, ok, err := right.Next()
+		if err != nil {
+			right.Close()
+			return nil, err
+		}
+		if !ok {
+			break
+		}
+		k, hasNull := KeyOf(r, rcols)
+		if hasNull {
+			continue
+		}
+		table[k] = append(table[k], r)
+		inserted++
+	}
+	if err := right.Close(); err != nil {
+		return nil, err
+	}
+	if inserted == 0 {
+		return nil, nil
+	}
+	if err := left.Open(); err != nil {
+		return nil, err
+	}
+	var out []types.Row
+	for {
+		l, ok, err := left.Next()
+		if err != nil {
+			left.Close()
+			return nil, err
+		}
+		if !ok {
+			break
+		}
+		k, hasNull := KeyOf(l, lcols)
+		if hasNull {
+			continue
+		}
+		for _, r := range table[k] {
+			m, err := spec.Match(l, r)
+			if err != nil {
+				left.Close()
+				return nil, err
+			}
+			if m {
+				out = append(out, Concat(l, r))
+			}
+		}
+	}
+	if err := left.Close(); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // Problem 8.8 — HashJoinOuter [Hard]
@@ -96,7 +158,84 @@ func HashJoinInner(left, right exec.Iterator, spec JoinSpec) ([]types.Row, error
 // Constraints: O(|left| + |right| + output) expected time, each input read once.
 // Postgres reference: ExecScanHashTableForUnmatched() in src/backend/executor/nodeHash.c, HJ_FILL_INNER/HJ_FILL_OUTER in nodeHashjoin.c
 func HashJoinOuter(left, right exec.Iterator, spec JoinSpec) ([]types.Row, error) {
-	panic("TODO: Problem 8.8")
+	switch spec.Type {
+	case Left, Right, Full:
+	default:
+		return nil, ErrUnsupportedJoin
+	}
+	fillLeft := spec.Type == Left || spec.Type == Full
+	fillRight := spec.Type == Right || spec.Type == Full
+	rcols, lcols := spec.RightCols(), spec.LeftCols()
+
+	if err := right.Open(); err != nil {
+		return nil, err
+	}
+	var build []types.Row
+	table := map[string][]int{} // key → positions in build
+	for {
+		r, ok, err := right.Next()
+		if err != nil {
+			right.Close()
+			return nil, err
+		}
+		if !ok {
+			break
+		}
+		if k, hasNull := KeyOf(r, rcols); !hasNull {
+			table[k] = append(table[k], len(build))
+		}
+		build = append(build, r)
+	}
+	if err := right.Close(); err != nil {
+		return nil, err
+	}
+	if len(build) == 0 && spec.Type == Right {
+		return nil, nil
+	}
+	matched := make([]bool, len(build))
+
+	if err := left.Open(); err != nil {
+		return nil, err
+	}
+	var out []types.Row
+	for {
+		l, ok, err := left.Next()
+		if err != nil {
+			left.Close()
+			return nil, err
+		}
+		if !ok {
+			break
+		}
+		found := false
+		if k, hasNull := KeyOf(l, lcols); !hasNull {
+			for _, pos := range table[k] {
+				m, err := spec.Match(l, build[pos])
+				if err != nil {
+					left.Close()
+					return nil, err
+				}
+				if m {
+					found, matched[pos] = true, true
+					out = append(out, Concat(l, build[pos]))
+				}
+			}
+		}
+		if !found && fillLeft {
+			out = append(out, Concat(l, NullRow(spec.RightWidth)))
+		}
+	}
+	if err := left.Close(); err != nil {
+		return nil, err
+	}
+	if fillRight {
+		for pos, r := range build {
+			if !matched[pos] {
+				out = append(out, Concat(NullRow(spec.LeftWidth), r))
+			}
+		}
+	}
+	return out, nil
 }
 
 // GraceConfig sets the memory budget of GraceHashJoin.
@@ -163,5 +302,75 @@ type GraceStats struct {
 // Constraints: every in-memory join holds at most MemRows build rows unless it is an overflow.
 // Postgres reference: ExecHashIncreaseNumBatches(), ExecHashJoinNewBatch() in src/backend/executor/nodeHash.c / nodeHashjoin.c
 func GraceHashJoin(left, right []types.Row, spec JoinSpec, cfg GraceConfig) ([]types.Row, GraceStats, error) {
-	panic("TODO: Problem 8.9")
+	var st GraceStats
+	if spec.Type != Inner {
+		return nil, st, ErrUnsupportedJoin
+	}
+	if cfg.MemRows < 1 || cfg.Fanout < 2 || cfg.MaxDepth < 0 {
+		return nil, st, ErrBadConfig
+	}
+	type keyed struct {
+		key string
+		row types.Row
+	}
+	withKeys := func(rows []types.Row, cols []int) []keyed {
+		var out []keyed
+		for _, r := range rows {
+			if k, hasNull := KeyOf(r, cols); !hasNull {
+				out = append(out, keyed{k, r})
+			}
+		}
+		return out
+	}
+	var out []types.Row
+	var join func(L, R []keyed, depth int) error
+	join = func(L, R []keyed, depth int) error {
+		if len(L) == 0 || len(R) == 0 {
+			return nil
+		}
+		if len(R) > cfg.MemRows && depth < cfg.MaxDepth {
+			st.Partitionings++
+			lp := make([][]keyed, cfg.Fanout)
+			rp := make([][]keyed, cfg.Fanout)
+			for _, x := range L {
+				p := PartitionOf(x.key, depth, cfg.Fanout)
+				lp[p] = append(lp[p], x)
+			}
+			for _, x := range R {
+				p := PartitionOf(x.key, depth, cfg.Fanout)
+				rp[p] = append(rp[p], x)
+			}
+			for i := 0; i < cfg.Fanout; i++ {
+				if err := join(lp[i], rp[i], depth+1); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+		if len(R) > cfg.MemRows {
+			st.Overflows++
+		}
+		st.BuildSizes = append(st.BuildSizes, len(R))
+		st.Deepest = max(st.Deepest, depth)
+		table := map[string][]types.Row{}
+		for _, x := range R {
+			table[x.key] = append(table[x.key], x.row)
+		}
+		for _, x := range L {
+			for _, r := range table[x.key] {
+				m, err := spec.Match(x.row, r)
+				if err != nil {
+					return err
+				}
+				if m {
+					out = append(out, Concat(x.row, r))
+				}
+			}
+		}
+		return nil
+	}
+	if err := join(withKeys(left, spec.LeftCols()), withKeys(right, spec.RightCols()), 0); err != nil {
+		return nil, GraceStats{}, err
+	}
+	return out, st, nil
 }

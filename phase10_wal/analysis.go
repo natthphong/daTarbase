@@ -50,5 +50,61 @@ type Analysis struct {
 // Constraints: one forward pass from the checkpoint.
 // Postgres reference: none — Postgres has no analysis pass (StartupXLOG starts redo at the checkpoint's redo pointer). See ARIES (Mohan et al., 1992), section 6.1.
 func Analyze(log []byte, master types.LSN) (Analysis, error) {
-	panic("TODO: Problem 10.11")
+	a := Analysis{ATT: map[types.TxnID]types.LSN{}, DPT: map[types.PageID]types.LSN{}, NextTxn: 1}
+	start := FirstLSN
+	if master != InvalidLSN {
+		start = master
+	}
+	recs, end, err := ReadRecords(log, start)
+	if err != nil {
+		if master != InvalidLSN {
+			return Analysis{}, ErrNoCheckpoint
+		}
+		return Analysis{}, err
+	}
+	a.End = end
+	if master != InvalidLSN {
+		if len(recs) == 0 || recs[0].Type != RecCheckpoint {
+			return Analysis{}, ErrNoCheckpoint
+		}
+		cp, err := DecodeCheckpoint(recs[0].Body)
+		if err != nil {
+			return Analysis{}, err
+		}
+		a.NextTxn = max(a.NextTxn, cp.NextTxn)
+		for _, e := range cp.ATT {
+			a.ATT[e.Txn] = e.LastLSN
+		}
+		for _, e := range cp.DPT {
+			a.DPT[e.Page] = e.RecLSN
+		}
+		recs = recs[1:]
+	}
+	for _, r := range recs {
+		if r.Txn != types.InvalidTxnID {
+			a.NextTxn = max(a.NextTxn, r.Txn+1)
+		}
+		switch r.Type {
+		case RecBegin, RecUpdate, RecCLR:
+			if r.Txn != types.InvalidTxnID {
+				a.ATT[r.Txn] = r.LSN
+			}
+		case RecCommit, RecAbort:
+			delete(a.ATT, r.Txn)
+		}
+		page, ok, err := RecordPage(r)
+		if err != nil {
+			return Analysis{}, err
+		}
+		if ok {
+			if _, seen := a.DPT[page]; !seen {
+				a.DPT[page] = r.LSN
+			}
+		}
+	}
+	a.RedoLSN = a.End
+	for _, l := range a.DPT {
+		a.RedoLSN = min(a.RedoLSN, l)
+	}
+	return a, nil
 }

@@ -1,6 +1,8 @@
 package storage
 
 import (
+	"errors"
+	"fmt"
 	"io"
 	"os"
 
@@ -88,7 +90,20 @@ func (d *FileDisk) Close() error { return d.f.Close() }
 // Constraints: no allocation besides error values.
 // Postgres reference: mdread() in src/backend/storage/smgr/md.c
 func (d *FileDisk) ReadPage(id types.PageID, buf []byte) error {
-	panic("TODO: Problem 3.1")
+	if len(buf) != PageSize {
+		return ErrBadBufferSize
+	}
+	if uint32(id) >= d.numPages {
+		return ErrPageNotFound
+	}
+	n, err := d.f.ReadAt(buf, int64(id)*PageSize)
+	if n == PageSize {
+		return nil
+	}
+	if errors.Is(err, io.EOF) {
+		return fmt.Errorf("read page %d: got %d of %d bytes: %w", id, n, PageSize, ErrPageNotFound)
+	}
+	return fmt.Errorf("read page %d: %w", id, err)
 }
 
 // Problem 3.2 — FileDisk.WritePage [Easy]
@@ -121,7 +136,24 @@ func (d *FileDisk) ReadPage(id types.PageID, buf []byte) error {
 // Constraints: no allocation besides error values.
 // Postgres reference: mdwrite() in src/backend/storage/smgr/md.c
 func (d *FileDisk) WritePage(id types.PageID, buf []byte) error {
-	panic("TODO: Problem 3.2")
+	if len(buf) != PageSize {
+		return ErrBadBufferSize
+	}
+	if uint32(id) >= d.numPages {
+		return ErrPageNotFound
+	}
+	off := int64(id) * PageSize
+	for done := 0; done < PageSize; {
+		n, err := d.f.WriteAt(buf[done:], off+int64(done))
+		done += n
+		if err != nil {
+			return fmt.Errorf("write page %d: %w", id, err)
+		}
+		if n == 0 {
+			return fmt.Errorf("write page %d: wrote %d of %d bytes: %w", id, done, PageSize, ErrShortWrite)
+		}
+	}
+	return nil
 }
 
 // Problem 3.3 — FileDisk.AllocatePage [Easy]
@@ -145,5 +177,14 @@ func (d *FileDisk) WritePage(id types.PageID, buf []byte) error {
 // Hint: you may reuse WritePage.
 // Postgres reference: mdextend() in src/backend/storage/smgr/md.c
 func (d *FileDisk) AllocatePage() (types.PageID, error) {
-	panic("TODO: Problem 3.3")
+	if d.numPages == uint32(types.InvalidPageID) {
+		return 0, ErrTooManyPages
+	}
+	id := types.PageID(d.numPages)
+	d.numPages++
+	if err := d.WritePage(id, make([]byte, PageSize)); err != nil {
+		d.numPages--
+		return 0, err
+	}
+	return id, nil
 }

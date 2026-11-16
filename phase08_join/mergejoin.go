@@ -52,7 +52,47 @@ import (
 // Constraints: O(|left| + |right| + output) comparisons; O(1) extra memory.
 // Postgres reference: ExecMergeJoin() (EXEC_MJ_JOINTUPLES, ExecMarkPos/ExecRestrPos) in src/backend/executor/nodeMergejoin.c
 func MergeJoinInner(left, right []types.Row, spec JoinSpec) ([]types.Row, error) {
-	panic("TODO: Problem 8.10")
+	if spec.Type != Inner {
+		return nil, ErrUnsupportedJoin
+	}
+	lcols, rcols := spec.LeftCols(), spec.RightCols()
+	var out []types.Row
+	i, j := 0, 0
+	for i < len(left) && j < len(right) {
+		c := CompareKeys(left[i], lcols, right[j], rcols)
+		if c == 0 {
+			if _, hasNull := KeyOf(left[i], lcols); hasNull {
+				c = -1 // equal only because of NULLs: not a match
+			}
+		}
+		switch {
+		case c < 0:
+			i++
+		case c > 0:
+			j++
+		default:
+			mark := j
+			end := j
+			for end < len(right) && CompareKeys(left[i], lcols, right[end], rcols) == 0 {
+				end++
+			}
+			// Replay right[mark:end] for every left row of this key group.
+			for i < len(left) && CompareKeys(left[i], lcols, right[mark], rcols) == 0 {
+				for k := mark; k < end; k++ {
+					m, err := spec.Match(left[i], right[k])
+					if err != nil {
+						return nil, err
+					}
+					if m {
+						out = append(out, Concat(left[i], right[k]))
+					}
+				}
+				i++
+			}
+			j = end
+		}
+	}
+	return out, nil
 }
 
 // Problem 8.11 — MergeJoinOuter [Hard]
@@ -90,5 +130,69 @@ func MergeJoinInner(left, right []types.Row, spec JoinSpec) ([]types.Row, error)
 // Constraints: O(|left| + |right| + output) comparisons.
 // Postgres reference: ExecMergeJoin() (EXEC_MJ_ENDOUTER / EXEC_MJ_ENDINNER, MJFillOuter/MJFillInner) in src/backend/executor/nodeMergejoin.c
 func MergeJoinOuter(left, right []types.Row, spec JoinSpec) ([]types.Row, error) {
-	panic("TODO: Problem 8.11")
+	if spec.Type != Left && spec.Type != Full {
+		return nil, ErrUnsupportedJoin
+	}
+	full := spec.Type == Full
+	lcols, rcols := spec.LeftCols(), spec.RightCols()
+	var out []types.Row
+	padLeft := func(l types.Row) { out = append(out, Concat(l, NullRow(spec.RightWidth))) }
+	padRight := func(r types.Row) {
+		if full {
+			out = append(out, Concat(NullRow(spec.LeftWidth), r))
+		}
+	}
+	i, j := 0, 0
+	for i < len(left) && j < len(right) {
+		c := CompareKeys(left[i], lcols, right[j], rcols)
+		if c == 0 {
+			if _, hasNull := KeyOf(left[i], lcols); hasNull {
+				c = -1
+			}
+		}
+		switch {
+		case c < 0:
+			padLeft(left[i])
+			i++
+		case c > 0:
+			padRight(right[j])
+			j++
+		default:
+			mark, end := j, j
+			for end < len(right) && CompareKeys(left[i], lcols, right[end], rcols) == 0 {
+				end++
+			}
+			rMatched := make([]bool, end-mark)
+			for i < len(left) && CompareKeys(left[i], lcols, right[mark], rcols) == 0 {
+				found := false
+				for k := mark; k < end; k++ {
+					m, err := spec.Match(left[i], right[k])
+					if err != nil {
+						return nil, err
+					}
+					if m {
+						found, rMatched[k-mark] = true, true
+						out = append(out, Concat(left[i], right[k]))
+					}
+				}
+				if !found {
+					padLeft(left[i])
+				}
+				i++
+			}
+			for k := mark; k < end; k++ {
+				if !rMatched[k-mark] {
+					padRight(right[k])
+				}
+			}
+			j = end
+		}
+	}
+	for ; i < len(left); i++ {
+		padLeft(left[i])
+	}
+	for ; j < len(right); j++ {
+		padRight(right[j])
+	}
+	return out, nil
 }

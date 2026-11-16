@@ -34,7 +34,40 @@ import "github.com/natthphong/daTarbase/pkg/types"
 // Constraints: O(len(body)).
 // Postgres reference: XLogReadBufferForRedo() (BLK_NEEDS_REDO / BLK_RESTORED / BLK_DONE) in src/backend/access/transam/xlogutils.c
 func RedoRecord(p *Page, rec Record) (bool, error) {
-	panic("TODO: Problem 10.9")
+	var off int
+	var data []byte
+	switch rec.Type {
+	case RecUpdate:
+		b, err := DecodeUpdate(rec.Body)
+		if err != nil {
+			return false, err
+		}
+		off, data = int(b.Off), b.After
+	case RecCLR:
+		b, err := DecodeCLR(rec.Body)
+		if err != nil {
+			return false, err
+		}
+		off, data = int(b.Off), b.Data
+	case RecFPI:
+		b, err := DecodeFPI(rec.Body)
+		if err != nil {
+			return false, err
+		}
+		p.Data, p.LSN = b.Image, rec.LSN
+		return true, nil
+	default:
+		return false, nil
+	}
+	if off+len(data) > PageDataSize {
+		return false, ErrCorruptRecord
+	}
+	if p.LSN >= rec.LSN {
+		return false, nil
+	}
+	copy(p.Data[off:], data)
+	p.LSN = rec.LSN
+	return true, nil
 }
 
 // Problem 10.12 — RedoPass [Medium]
@@ -72,5 +105,33 @@ func RedoRecord(p *Page, rec Record) (bool, error) {
 // Constraints: one pass over the log.
 // Postgres reference: PerformWalRecovery() / ApplyWalRecord() in src/backend/access/transam/xlogrecovery.c
 func (db *DB) RedoPass(dpt map[types.PageID]types.LSN, from types.LSN) (int, error) {
-	panic("TODO: Problem 10.12")
+	recs, _, err := ReadRecords(db.Log.Bytes(), from)
+	if err != nil {
+		return 0, err
+	}
+	applied := 0
+	for _, r := range recs {
+		page, ok, err := RecordPage(r)
+		if err != nil {
+			return applied, err
+		}
+		if !ok {
+			continue
+		}
+		rec, inDPT := dpt[page]
+		if !inDPT || r.LSN < rec {
+			continue
+		}
+		did, err := RedoRecord(db.BP.Page(page), r)
+		if err != nil {
+			return applied, err
+		}
+		if did {
+			applied++
+			if _, d := db.BP.dirty[page]; !d {
+				db.BP.dirty[page] = rec
+			}
+		}
+	}
+	return applied, nil
 }

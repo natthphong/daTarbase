@@ -2,7 +2,7 @@ package sortagg
 
 import (
 	"bufio"
-
+	"container/heap"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -10,6 +10,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"slices"
 
 	"github.com/natthphong/daTarbase/pkg/exec"
 	"github.com/natthphong/daTarbase/pkg/types"
@@ -278,7 +279,58 @@ func (s *RunStore) ReadAll(path string) ([]types.Row, error) {
 // Constraints: memory O(memRows) rows.
 // Postgres reference: dumptuples() in src/backend/utils/sort/tuplesort.c
 func GenerateRuns(child exec.Iterator, keys []SortKey, memRows int, store *RunStore) (runs []string, err error) {
-	panic("TODO: Problem 7.4")
+	if memRows < 1 {
+		return nil, ErrBadMemory
+	}
+	if err := child.Open(); err != nil {
+		return nil, err
+	}
+	defer func() {
+		if cerr := child.Close(); err == nil {
+			err = cerr
+		}
+	}()
+	buf := make([]types.Row, 0, memRows)
+	flush := func() error {
+		slices.SortStableFunc(buf, func(a, b types.Row) int { return CompareRows(a, b, keys) })
+		w, err := store.CreateRun()
+		if err != nil {
+			return err
+		}
+		for _, r := range buf {
+			if err := w.Write(r); err != nil {
+				w.Close()
+				return err
+			}
+		}
+		if err := w.Close(); err != nil {
+			return err
+		}
+		runs = append(runs, w.Path())
+		buf = buf[:0]
+		return nil
+	}
+	for {
+		r, ok, err := child.Next()
+		if err != nil {
+			return runs, err
+		}
+		if !ok {
+			break
+		}
+		buf = append(buf, r)
+		if len(buf) == memRows {
+			if err := flush(); err != nil {
+				return runs, err
+			}
+		}
+	}
+	if len(buf) > 0 {
+		if err := flush(); err != nil {
+			return runs, err
+		}
+	}
+	return runs, nil
 }
 
 // Problem 7.5 — MergeRuns [Hard]
@@ -311,7 +363,68 @@ func GenerateRuns(child exec.Iterator, keys []SortKey, memRows int, store *RunSt
 // Constraints: O(N log k) comparisons, at most one row per run in memory.
 // Postgres reference: mergeonerun() / beginmerge() in src/backend/utils/sort/tuplesort.c
 func MergeRuns(store *RunStore, runs []string, keys []SortKey) (out string, err error) {
-	panic("TODO: Problem 7.5")
+	if len(runs) == 0 {
+		return "", ErrNoRuns
+	}
+	type head struct {
+		row types.Row
+		run int
+	}
+	readers := make([]*RunReader, 0, len(runs))
+	defer func() {
+		for _, rd := range readers {
+			if cerr := rd.Close(); err == nil {
+				err = cerr
+			}
+		}
+	}()
+	h := &sliceHeap[head]{less: func(a, b head) bool {
+		if c := CompareRows(a.row, b.row, keys); c != 0 {
+			return c < 0
+		}
+		return a.run < b.run
+	}}
+	for i, p := range runs {
+		rd, err := store.OpenRun(p)
+		if err != nil {
+			return "", err
+		}
+		readers = append(readers, rd)
+		row, ok, err := rd.Next()
+		if err != nil {
+			return "", err
+		}
+		if ok {
+			h.items = append(h.items, head{row, i})
+		}
+	}
+	heap.Init(h)
+	w, err := store.CreateRun()
+	if err != nil {
+		return "", err
+	}
+	defer func() {
+		if cerr := w.Close(); err == nil {
+			err = cerr
+		}
+	}()
+	for h.Len() > 0 {
+		top := h.items[0]
+		if err := w.Write(top.row); err != nil {
+			return "", err
+		}
+		row, ok, err := readers[top.run].Next()
+		if err != nil {
+			return "", err
+		}
+		if ok {
+			h.items[0] = head{row, top.run}
+			heap.Fix(h, 0)
+		} else {
+			heap.Pop(h)
+		}
+	}
+	return w.Path(), nil
 }
 
 // Problem 7.6 — MergeAll [Medium]
@@ -343,7 +456,35 @@ func MergeRuns(store *RunStore, runs []string, keys []SortKey) (out string, err 
 // Constraints: never more than fanIn readers open at once.
 // Postgres reference: mergeruns() in src/backend/utils/sort/tuplesort.c
 func MergeAll(store *RunStore, runs []string, keys []SortKey, fanIn int) (final string, passes int, err error) {
-	panic("TODO: Problem 7.6")
+	if fanIn < 2 {
+		return "", 0, ErrBadFanIn
+	}
+	if len(runs) == 0 {
+		return "", 0, nil
+	}
+	for len(runs) > 1 {
+		passes++
+		var next []string
+		for i := 0; i < len(runs); i += fanIn {
+			group := runs[i:min(i+fanIn, len(runs))]
+			if len(group) == 1 {
+				next = append(next, group[0])
+				continue
+			}
+			out, err := MergeRuns(store, group, keys)
+			if err != nil {
+				return "", passes, err
+			}
+			for _, p := range group {
+				if err := store.Remove(p); err != nil {
+					return "", passes, err
+				}
+			}
+			next = append(next, out)
+		}
+		runs = next
+	}
+	return runs[0], passes, nil
 }
 
 // ExternalSort is ORDER BY with a memory limit: it spills sorted runs to
@@ -381,7 +522,22 @@ type ExternalSort struct {
 //
 // Postgres reference: tuplesort_performsort() in src/backend/utils/sort/tuplesort.c
 func (e *ExternalSort) Open() error {
-	panic("TODO: Problem 7.7")
+	e.Store = NewRunStore(e.Dir)
+	e.final, e.reader = "", nil
+	runs, err := GenerateRuns(e.Child, e.Keys, e.MemRows, e.Store)
+	if err != nil {
+		return err
+	}
+	final, _, err := MergeAll(e.Store, runs, e.Keys, e.FanIn)
+	if err != nil {
+		return err
+	}
+	if final == "" {
+		return nil
+	}
+	e.final = final
+	e.reader, err = e.Store.OpenRun(final)
+	return err
 }
 
 // Next returns the next sorted row.

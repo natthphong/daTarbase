@@ -4,7 +4,9 @@
 package tuple
 
 import (
+	"encoding/binary"
 	"errors"
+	"math"
 
 	"github.com/natthphong/daTarbase/pkg/types"
 )
@@ -105,7 +107,7 @@ type TupleHeader struct {
 // Constraints: O(1), no loops. Hint: align-1 is a bit mask.
 // Postgres reference: TYPEALIGN() / att_align_nominal() in src/include/c.h, access/tupmacs.h
 func AlignUp(off, align int) int {
-	panic("TODO: Problem 1.1")
+	return (off + align - 1) &^ (align - 1)
 }
 
 // Problem 1.2 — AppendFixed [Easy]
@@ -130,7 +132,20 @@ func AlignUp(off, align int) int {
 // Constraints: append only, no extra allocation beyond append's growth.
 // Postgres reference: store_att_byval() in src/include/access/tupmacs.h
 func AppendFixed(buf []byte, v types.Value) ([]byte, error) {
-	panic("TODO: Problem 1.2")
+	switch v.Kind {
+	case types.KindBool:
+		if v.B {
+			return append(buf, 1), nil
+		}
+		return append(buf, 0), nil
+	case types.KindInt32:
+		return binary.LittleEndian.AppendUint32(buf, uint32(int32(v.I))), nil
+	case types.KindInt64:
+		return binary.LittleEndian.AppendUint64(buf, uint64(v.I)), nil
+	case types.KindFloat64:
+		return binary.LittleEndian.AppendUint64(buf, math.Float64bits(v.F)), nil
+	}
+	return buf, ErrNotFixed
 }
 
 // Problem 1.3 — DecodeFixed [Easy]
@@ -152,7 +167,23 @@ func AppendFixed(buf []byte, v types.Value) ([]byte, error) {
 //
 // Postgres reference: fetch_att() in src/include/access/tupmacs.h
 func DecodeFixed(kind types.Kind, src []byte) (types.Value, error) {
-	panic("TODO: Problem 1.3")
+	n := AttLen(kind)
+	if n <= 0 {
+		return types.Value{}, ErrNotFixed
+	}
+	if len(src) < n {
+		return types.Value{}, ErrShortBuffer
+	}
+	switch kind {
+	case types.KindBool:
+		return types.Bool(src[0] != 0), nil
+	case types.KindInt32:
+		return types.Int32(int32(binary.LittleEndian.Uint32(src))), nil
+	case types.KindInt64:
+		return types.Int64(int64(binary.LittleEndian.Uint64(src))), nil
+	default:
+		return types.Float64(math.Float64frombits(binary.LittleEndian.Uint64(src))), nil
+	}
 }
 
 // Problem 1.4 — AppendVarlena [Medium]
@@ -184,7 +215,12 @@ func DecodeFixed(kind types.Kind, src []byte) (types.Value, error) {
 //
 // Postgres reference: SET_VARSIZE_SHORT / SET_VARSIZE (varatt.h), heap_fill_tuple()
 func AppendVarlena(buf []byte, s string) []byte {
-	panic("TODO: Problem 1.4")
+	if total := 1 + len(s); total <= VarlenaShortMax {
+		buf = append(buf, byte(total<<1|1))
+	} else {
+		buf = binary.LittleEndian.AppendUint32(buf, uint32(len(s)+VarlenaLongHdr)<<2)
+	}
+	return append(buf, s...)
 }
 
 // Problem 1.5 — DecodeVarlena [Medium]
@@ -212,7 +248,31 @@ func AppendVarlena(buf []byte, s string) []byte {
 //
 // Postgres reference: VARSIZE_ANY() / VARDATA_ANY() in src/include/varatt.h
 func DecodeVarlena(src []byte) (string, int, error) {
-	panic("TODO: Problem 1.5")
+	if len(src) == 0 {
+		return "", 0, ErrShortBuffer
+	}
+	var hdr, total int
+	switch {
+	case src[0]&1 == 1:
+		hdr, total = 1, int(src[0]>>1)
+		if total == 0 {
+			return "", 0, ErrBadVarlena
+		}
+	case src[0]&3 == 0:
+		if len(src) < VarlenaLongHdr {
+			return "", 0, ErrShortBuffer
+		}
+		hdr, total = VarlenaLongHdr, int(binary.LittleEndian.Uint32(src)>>2)
+		if total < VarlenaLongHdr {
+			return "", 0, ErrBadVarlena
+		}
+	default:
+		return "", 0, ErrBadVarlena
+	}
+	if total > len(src) {
+		return "", 0, ErrShortBuffer
+	}
+	return string(src[hdr:total]), total, nil
 }
 
 // Problem 1.6 — NullBitmap [Easy]
@@ -238,7 +298,20 @@ func DecodeVarlena(src []byte) (string, int, error) {
 //
 // Postgres reference: heap_fill_tuple() bitmap part in src/backend/access/common/heaptuple.c
 func NullBitmap(row types.Row) []byte {
-	panic("TODO: Problem 1.6")
+	hasNull := false
+	for _, v := range row {
+		hasNull = hasNull || v.IsNull()
+	}
+	if !hasNull {
+		return nil
+	}
+	bm := make([]byte, BitmapLen(len(row)))
+	for i, v := range row {
+		if !v.IsNull() {
+			bm[i/8] |= 1 << (i % 8)
+		}
+	}
+	return bm
 }
 
 // Problem 1.7 — AttIsNull [Easy]
@@ -257,7 +330,10 @@ func NullBitmap(row types.Row) []byte {
 //
 // Postgres reference: att_isnull() in src/include/access/tupmacs.h
 func AttIsNull(bitmap []byte, i int) bool {
-	panic("TODO: Problem 1.7")
+	if len(bitmap) == 0 {
+		return false
+	}
+	return bitmap[i/8]&(1<<(i%8)) == 0
 }
 
 // Problem 1.8 — AppendHeader [Medium]
@@ -286,7 +362,11 @@ func AttIsNull(bitmap []byte, i int) bool {
 //
 // Postgres reference: HeapTupleHeaderData in src/include/access/htup_details.h
 func AppendHeader(buf []byte, h TupleHeader) []byte {
-	panic("TODO: Problem 1.8")
+	buf = binary.LittleEndian.AppendUint32(buf, uint32(h.Xmin))
+	buf = binary.LittleEndian.AppendUint32(buf, uint32(h.Xmax))
+	buf = binary.LittleEndian.AppendUint16(buf, h.Infomask)
+	buf = binary.LittleEndian.AppendUint16(buf, h.Natts)
+	return append(buf, h.Hoff)
 }
 
 // Problem 1.9 — DecodeHeader [Medium]
@@ -309,5 +389,22 @@ func AppendHeader(buf []byte, h TupleHeader) []byte {
 //
 // Postgres reference: HeapTupleHeaderGetNatts / t_hoff in src/include/access/htup_details.h
 func DecodeHeader(data []byte) (TupleHeader, error) {
-	panic("TODO: Problem 1.9")
+	if len(data) < HeaderSize {
+		return TupleHeader{}, ErrShortBuffer
+	}
+	h := TupleHeader{
+		Xmin:     types.TxnID(binary.LittleEndian.Uint32(data[0:])),
+		Xmax:     types.TxnID(binary.LittleEndian.Uint32(data[4:])),
+		Infomask: binary.LittleEndian.Uint16(data[8:]),
+		Natts:    binary.LittleEndian.Uint16(data[10:]),
+		Hoff:     data[12],
+	}
+	min := HeaderSize
+	if h.Infomask&HeapHasNull != 0 {
+		min += BitmapLen(int(h.Natts))
+	}
+	if h.Hoff%8 != 0 || int(h.Hoff) < min || int(h.Hoff) > len(data) {
+		return TupleHeader{}, ErrCorrupt
+	}
+	return h, nil
 }

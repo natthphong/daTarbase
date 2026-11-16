@@ -48,7 +48,18 @@ func (d *HashDistinct) Close() error {
 //
 // Postgres reference: lookup_hash_entries() in src/backend/executor/nodeAgg.c
 func (d *HashDistinct) Next() (types.Row, bool, error) {
-	panic("TODO: Problem 7.12")
+	for {
+		r, ok, err := d.Child.Next()
+		if err != nil || !ok {
+			return nil, false, err
+		}
+		k := r.HashKey()
+		if d.seen[k] {
+			continue
+		}
+		d.seen[k] = true
+		return r, true, nil
+	}
 }
 
 // Unique removes ADJACENT duplicate rows from sorted input (Postgres: the
@@ -91,5 +102,24 @@ func (u *Unique) Close() error { return u.Child.Close() }
 //
 // Postgres reference: ExecUnique() in src/backend/executor/nodeUnique.c
 func (u *Unique) Next() (types.Row, bool, error) {
-	panic("TODO: Problem 7.13")
+	for {
+		r, ok, err := u.Child.Next()
+		if err != nil || !ok {
+			return nil, false, err
+		}
+		if u.hasPrev && len(r) == len(u.prev) {
+			same := true
+			for i := range r {
+				if !types.Identical(r[i], u.prev[i]) {
+					same = false
+					break
+				}
+			}
+			if same {
+				continue
+			}
+		}
+		u.prev, u.hasPrev = r, true
+		return r, true, nil
+	}
 }

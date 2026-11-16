@@ -141,5 +141,9 @@ func (l *Log) fsync(from types.LSN, data []byte) {
 // Constraints: amortised O(len(Body)).
 // Postgres reference: XLogInsertRecord() / CopyXLogRecordToWAL() in src/backend/access/transam/xlog.c
 func (l *Log) Append(rec Record) types.LSN {
-	panic("TODO: Problem 10.3")
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	rec.LSN = types.LSN(len(l.buf))
+	l.buf = append(l.buf, EncodeRecord(rec)...)
+	return rec.LSN
 }

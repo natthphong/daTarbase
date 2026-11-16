@@ -1,6 +1,9 @@
 package sortagg
 
 import (
+	"container/heap"
+	"slices"
+
 	"github.com/natthphong/daTarbase/pkg/exec"
 	"github.com/natthphong/daTarbase/pkg/types"
 )
@@ -44,7 +47,22 @@ func NewSort(child exec.Iterator, keys ...SortKey) *Sort { return &Sort{Child: c
 // Constraints: O(n log n) comparisons.
 // Postgres reference: ExecSort() in src/backend/executor/nodeSort.c
 func (s *Sort) Open() error {
-	panic("TODO: Problem 7.2")
+	if err := s.Child.Open(); err != nil {
+		return err
+	}
+	s.rows, s.pos = nil, 0
+	for {
+		r, ok, err := s.Child.Next()
+		if err != nil {
+			return err
+		}
+		if !ok {
+			break
+		}
+		s.rows = append(s.rows, r)
+	}
+	slices.SortStableFunc(s.rows, func(a, b types.Row) int { return CompareRows(a, b, s.Keys) })
+	return nil
 }
 
 // Next returns the next sorted row.
@@ -123,7 +141,82 @@ func NewTopN(child exec.Iterator, n int, keys ...SortKey) *TopN {
 // Constraints: O(n log N) time, O(N) memory.
 // Postgres reference: make_bounded_heap() / puttuple_common() in src/backend/utils/sort/tuplesort.c
 func (t *TopN) Open() error {
-	panic("TODO: Problem 7.3")
+	if err := t.Child.Open(); err != nil {
+		return err
+	}
+	t.heap, t.out, t.pos = nil, nil, 0
+	if t.N <= 0 {
+		return nil
+	}
+	// worse(a, b): a sorts after b.
+	worse := func(a, b topNEntry) bool {
+		if c := CompareRows(a.Row, b.Row, t.Keys); c != 0 {
+			return c > 0
+		}
+		return a.Seq > b.Seq
+	}
+	h := &sliceHeap[topNEntry]{less: worse}
+	for seq := 0; ; seq++ {
+		r, ok, err := t.Child.Next()
+		if err != nil {
+			return err
+		}
+		if !ok {
+			break
+		}
+		e := topNEntry{Row: r, Seq: seq}
+		if len(h.items) < t.N {
+			heap.Push(h, e)
+			t.Peak = max(t.Peak, len(h.items))
+			continue
+		}
+		if worse(h.items[0], e) {
+			h.items[0] = e
+			heap.Fix(h, 0)
+		}
+	}
+	t.heap = h.items
+	sorted := slices.Clone(t.heap)
+	slices.SortFunc(sorted, func(a, b topNEntry) int {
+		if worse(a, b) {
+			return 1
+		}
+		if worse(b, a) {
+			return -1
+		}
+		return 0
+	})
+	for _, e := range sorted {
+		t.out = append(t.out, e.Row)
+	}
+	return nil
+}
+
+// sliceHeap adapts a slice to container/heap with a custom Less.
+//
+// solution-only
+type sliceHeap[T any] struct {
+	items []T
+	less  func(a, b T) bool
+}
+
+// solution-only
+func (h *sliceHeap[T]) Len() int { return len(h.items) }
+
+// solution-only
+func (h *sliceHeap[T]) Less(i, j int) bool { return h.less(h.items[i], h.items[j]) }
+
+// solution-only
+func (h *sliceHeap[T]) Swap(i, j int) { h.items[i], h.items[j] = h.items[j], h.items[i] }
+
+// solution-only
+func (h *sliceHeap[T]) Push(x any) { h.items = append(h.items, x.(T)) }
+
+// solution-only
+func (h *sliceHeap[T]) Pop() any {
+	x := h.items[len(h.items)-1]
+	h.items = h.items[:len(h.items)-1]
+	return x
 }
 
 // Next returns the next of the top N rows.

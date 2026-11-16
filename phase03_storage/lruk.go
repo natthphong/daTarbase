@@ -107,5 +107,29 @@ func (r *LRUKReplacer) Size() int { return r.size }
 // Postgres reference: none — Postgres uses clock sweep; LRU-K is the classic
 // alternative studied for database buffer pools.
 func (r *LRUKReplacer) Evict() (FrameID, bool) {
-	panic("TODO: Problem 3.10")
+	var (
+		victim   FrameID
+		found    bool
+		bestInf  bool
+		bestTime uint64
+	)
+	for f, h := range r.history {
+		if !r.evictable[f] {
+			continue
+		}
+		inf := len(h) < r.k
+		better := !found ||
+			(inf && !bestInf) ||
+			(inf == bestInf && h[0] < bestTime)
+		if better {
+			victim, found, bestInf, bestTime = f, true, inf, h[0]
+		}
+	}
+	if !found {
+		return 0, false
+	}
+	delete(r.history, victim)
+	delete(r.evictable, victim)
+	r.size--
+	return victim, true
 }

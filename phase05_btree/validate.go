@@ -1,5 +1,11 @@
 package btree
 
+import (
+	"fmt"
+
+	"github.com/natthphong/daTarbase/pkg/types"
+)
+
 // Problem 5.22 — Validate [Medium]
 //
 // Check every structural invariant of the tree and report the first violation (an amcheck for your index).
@@ -34,5 +40,70 @@ package btree
 // (missing nodes, wrong child counts, wrong Height).
 // Postgres reference: contrib/amcheck (bt_index_check, verify_nbtree.c)
 func (t *Tree) Validate() error {
-	panic("TODO: Problem 5.22")
+	bad := func(format string, args ...any) error {
+		return fmt.Errorf("%w: "+format, append([]any{ErrInvalidTree}, args...)...)
+	}
+	var leaves []*Node
+	var walk func(id types.PageID, depth int, low, high *Item) error
+	walk = func(id types.PageID, depth int, low, high *Item) error {
+		n := t.Store.Get(id)
+		if n == nil {
+			return bad("node %d does not exist", id)
+		}
+		if depth > t.Height || (depth == t.Height) != n.Leaf {
+			return bad("node %d (leaf=%v) at depth %d, height %d", id, n.Leaf, depth, t.Height)
+		}
+		if len(n.Items) > t.MaxItems {
+			return bad("node %d has %d items > max %d", id, len(n.Items), t.MaxItems)
+		}
+		if depth > 1 && len(n.Items) < t.MinItems() {
+			return bad("node %d has %d items < min %d", id, len(n.Items), t.MinItems())
+		}
+		for i, it := range n.Items {
+			if i > 0 && CompareItems(n.Items[i-1], it) >= 0 {
+				return bad("node %d items %d,%d out of order", id, i-1, i)
+			}
+			if low != nil && CompareItems(it, *low) < 0 {
+				return bad("node %d item %d below low bound", id, i)
+			}
+			if high != nil && CompareItems(it, *high) >= 0 {
+				return bad("node %d item %d not below high bound", id, i)
+			}
+		}
+		if n.Leaf {
+			leaves = append(leaves, n)
+			return nil
+		}
+		if len(n.Items) == 0 || len(n.Children) != len(n.Items)+1 {
+			return bad("internal node %d has %d items, %d children", id, len(n.Items), len(n.Children))
+		}
+		for i, c := range n.Children {
+			lo, hi := low, high
+			if i > 0 {
+				lo = &n.Items[i-1]
+			}
+			if i < len(n.Items) {
+				hi = &n.Items[i]
+			}
+			if err := walk(c, depth+1, lo, hi); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if err := walk(t.Root, 1, nil, nil); err != nil {
+		return err
+	}
+	for i, l := range leaves {
+		if i == 0 && l.Prev != types.InvalidPageID {
+			return bad("first leaf %d has Prev %d", l.ID, l.Prev)
+		}
+		if i == len(leaves)-1 && l.Next != types.InvalidPageID {
+			return bad("last leaf %d has Next %d", l.ID, l.Next)
+		}
+		if i > 0 && (leaves[i-1].Next != l.ID || l.Prev != leaves[i-1].ID) {
+			return bad("leaves %d and %d are not linked", leaves[i-1].ID, l.ID)
+		}
+	}
+	return nil
 }

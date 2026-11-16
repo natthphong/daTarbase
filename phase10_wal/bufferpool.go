@@ -94,5 +94,14 @@ func (bp *BufferPool) FlushAll() error {
 // Constraints: at most one FlushUpTo and one WritePage per call.
 // Postgres reference: FlushBuffer() in src/backend/storage/buffer/bufmgr.c (XLogFlush(BufferGetLSN) before smgrwrite)
 func (bp *BufferPool) FlushPage(id types.PageID) error {
-	panic("TODO: Problem 10.6")
+	if _, ok := bp.dirty[id]; !ok {
+		return nil
+	}
+	p := bp.pages[id]
+	bp.log.FlushUpTo(p.LSN)
+	if err := bp.disk.WritePage(id, *p); err != nil {
+		return err
+	}
+	delete(bp.dirty, id)
+	return nil
 }

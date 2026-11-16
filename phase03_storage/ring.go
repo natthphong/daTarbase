@@ -65,5 +65,45 @@ func NewRing(size int) *Ring {
 //
 // Postgres reference: GetBufferFromRing() / AddBufferToRing() in src/backend/storage/buffer/freelist.c
 func (bp *BufferPool) FetchPageWithRing(id types.PageID, ring *Ring) (*Frame, error) {
-	panic("TODO: Problem 3.17")
+	bp.mu.Lock()
+	defer bp.mu.Unlock()
+	if fid, ok := bp.pageTable[id]; ok {
+		f := bp.frames[fid]
+		f.PinCount++
+		bp.replacer.RecordAccess(fid)
+		bp.replacer.SetEvictable(fid, false)
+		return f, nil
+	}
+	s := ring.next
+	ring.next = (s + 1) % len(ring.slots)
+	var fid FrameID
+	if c := ring.slots[s]; c >= 0 && bp.frames[c].PageID != types.InvalidPageID && bp.frames[c].PinCount == 0 {
+		f := bp.frames[c]
+		if f.Dirty {
+			if err := bp.disk.WritePage(f.PageID, f.Data); err != nil {
+				return nil, err
+			}
+		}
+		bp.replacer.Remove(c)
+		delete(bp.pageTable, f.PageID)
+		f.PageID, f.Dirty = types.InvalidPageID, false
+		fid = c
+	} else {
+		var err error
+		if fid, err = bp.acquireFrame(); err != nil {
+			return nil, err
+		}
+		ring.slots[s] = fid
+	}
+	f := bp.frames[fid]
+	if err := bp.disk.ReadPage(id, f.Data); err != nil {
+		ring.slots[s] = -1
+		bp.freeList = append(bp.freeList, fid)
+		return nil, err
+	}
+	f.PageID, f.PinCount, f.Dirty = id, 1, false
+	bp.pageTable[id] = fid
+	bp.replacer.RecordAccess(fid)
+	bp.replacer.SetEvictable(fid, false)
+	return f, nil
 }

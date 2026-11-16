@@ -58,5 +58,29 @@ func Desc(col int) SortKey { return Key(col, true) }
 // Constraints: O(len(keys)), no allocation.
 // Postgres reference: ApplySortComparator() in src/include/utils/sortsupport.h
 func CompareRows(a, b types.Row, keys []SortKey) int {
-	panic("TODO: Problem 7.1")
+	for _, k := range keys {
+		x, y := a[k.Col], b[k.Col]
+		switch {
+		case x.IsNull() && y.IsNull():
+			continue
+		case x.IsNull():
+			if k.NullsFirst {
+				return -1
+			}
+			return 1
+		case y.IsNull():
+			if k.NullsFirst {
+				return 1
+			}
+			return -1
+		}
+		c := types.Compare(x, y)
+		if k.Desc {
+			c = -c
+		}
+		if c != 0 {
+			return c
+		}
+	}
+	return 0
 }

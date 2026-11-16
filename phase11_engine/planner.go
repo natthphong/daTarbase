@@ -1,7 +1,16 @@
 package engine
 
 import (
+	"fmt"
+	"slices"
+	"strings"
+
+	executor "github.com/natthphong/daTarbase/phase06_executor"
+	sortagg "github.com/natthphong/daTarbase/phase07_sortagg"
+	join "github.com/natthphong/daTarbase/phase08_join"
 	txn "github.com/natthphong/daTarbase/phase09_txn"
+	"github.com/natthphong/daTarbase/pkg/exec"
+	"github.com/natthphong/daTarbase/pkg/types"
 )
 
 // ScanRequest describes the scan of one table inside a statement.
@@ -63,7 +72,86 @@ type ScanRequest struct {
 // Postgres reference: create_index_paths() / match_clause_to_indexcol() in
 // src/backend/optimizer/path/indxpath.c, create_scan_plan() in createplan.c
 func (t *Txn) PlanScan(snap *txn.Snapshot, req ScanRequest) (*Plan, error) {
-	panic("TODO: Problem 11.14")
+	h := t.db.heaps[req.Table]
+	if h == nil {
+		return nil, fmt.Errorf("%w: %q", ErrNoSuchTable, req.Table)
+	}
+	def := h.Def
+	conds, err := bindConds(def, req.Conds)
+	if err != nil {
+		return nil, err
+	}
+	var best *Index
+	bestCond := -1
+	for i, c := range conds {
+		if c.Op == executor.OpNE || c.Val.IsNull() {
+			continue
+		}
+		for _, ix := range t.db.indexesOf(def.Name) {
+			if ix.KeyCols[0] != c.Col {
+				continue
+			}
+			if best == nil || (c.Op == executor.OpEQ && conds[bestCond].Op != executor.OpEQ) {
+				best, bestCond = ix, i
+			}
+			break
+		}
+	}
+	cols := qualifiedNames(def)
+	clog, mine := t.db.mgr.Clog, t.mine()
+	node := &PlanNode{}
+	var it exec.Iterator
+	if best == nil {
+		it = &SeqScan{Heap: h, Snap: snap, Clog: clog, Mine: mine, EmitTID: req.EmitTID}
+		node.Name = "Seq Scan on " + def.Name
+	} else {
+		c := conds[bestCond]
+		lo, hi, err := KeyBounds(c.Op, c.Val)
+		if err != nil {
+			return nil, err
+		}
+		covering := !req.EmitTID && req.Need != nil
+		if covering {
+			var used []int
+			for _, n := range req.Need {
+				i, err := resolve(cols, n)
+				if err != nil {
+					return nil, err
+				}
+				used = append(used, i)
+			}
+			for _, bc := range conds {
+				used = append(used, bc.Col)
+			}
+			covering = best.covers(used)
+		}
+		if covering {
+			it = &IndexOnlyScan{Index: best, Lo: lo, Hi: hi, Snap: snap, Clog: clog, Mine: mine}
+			cols = best.Columns()
+			node.Name = "Index Only Scan using " + best.Def.Name + " on " + def.Name
+		} else {
+			it = &IndexScan{Index: best, Lo: lo, Hi: hi, Snap: snap, Clog: clog, Mine: mine, EmitTID: req.EmitTID}
+			node.Name = "Index Scan using " + best.Def.Name + " on " + def.Name
+		}
+		ic, err := predicate([]boundCond{c}, cols)
+		if err != nil {
+			return nil, err
+		}
+		node.Details = append(node.Details, "Index Cond: "+ic.String())
+		conds = slices.Delete(slices.Clone(conds), bestCond, bestCond+1)
+	}
+	if req.EmitTID {
+		cols = append(cols, "ctid")
+	}
+	if len(conds) > 0 {
+		pred, err := predicate(conds, cols)
+		if err != nil {
+			return nil, err
+		}
+		it = &executor.Filter{Child: it, Pred: pred}
+		node.Details = append(node.Details, "Filter: "+pred.String())
+	}
+	return &Plan{Iter: it, Cols: cols, Node: node}, nil
 }
 
 // Problem 11.15 — PlanJoin [Medium]
@@ -110,7 +198,43 @@ func (t *Txn) PlanScan(snap *txn.Snapshot, req ScanRequest) (*Plan, error) {
 // Postgres reference: hash_inner_and_outer() in src/backend/optimizer/path/joinpath.c,
 // ExecHashJoin() in src/backend/executor/nodeHashjoin.c
 func PlanJoin(left, right *Plan, typ JoinType, leftCol, rightCol string) (*Plan, error) {
-	panic("TODO: Problem 11.15")
+	l, err := resolve(left.Cols, leftCol)
+	if err != nil {
+		return nil, err
+	}
+	r, err := resolve(right.Cols, rightCol)
+	if err != nil {
+		return nil, err
+	}
+	spec := join.JoinSpec{Type: typ, Keys: []join.KeyPair{{Left: l, Right: r}}, LeftWidth: len(left.Cols), RightWidth: len(right.Cols)}
+	cond := "(" + left.Cols[l] + " = " + right.Cols[r] + ")"
+	var fn func(a, b exec.Iterator, s join.JoinSpec) ([]types.Row, error)
+	node := &PlanNode{}
+	cols := append(slices.Clone(left.Cols), right.Cols...)
+	switch typ {
+	case join.Inner, join.Left, join.Right, join.Full:
+		fn = join.HashJoinOuter
+		if typ == join.Inner {
+			fn = join.HashJoinInner
+		}
+		node.Name = map[JoinType]string{join.Inner: "Hash Join", join.Left: "Hash Left Join", join.Right: "Hash Right Join", join.Full: "Hash Full Join"}[typ]
+		node.Details = []string{"Hash Cond: " + cond}
+		node.Children = []*PlanNode{left.Node, {Name: "Hash", Children: []*PlanNode{right.Node}}}
+	case join.Semi, join.Anti:
+		fn = join.NestedLoopSemiAnti
+		node.Name = "Nested Loop Semi Join"
+		if typ == join.Anti {
+			node.Name = "Nested Loop Anti Join"
+		}
+		node.Details = []string{"Join Filter: " + cond}
+		node.Children = []*PlanNode{left.Node, right.Node}
+		cols = slices.Clone(left.Cols)
+	default:
+		return nil, fmt.Errorf("%w: join type %s", ErrBadQuery, typ)
+	}
+	li, ri := left.Iter, right.Iter
+	it := &materialized{run: func() ([]types.Row, error) { return fn(li, ri, spec) }}
+	return &Plan{Iter: it, Cols: cols, Node: node}, nil
 }
 
 // Problem 11.16 — Txn.PlanQuery [Hard]
@@ -163,5 +287,106 @@ func PlanJoin(left, right *Plan, typ JoinType, leftCol, rightCol string) (*Plan,
 // Constraints: nothing is opened or read while planning.
 // Postgres reference: grouping_planner() in src/backend/optimizer/plan/planner.c
 func (t *Txn) PlanQuery(q *Query) (*Plan, error) {
-	panic("TODO: Problem 11.16")
+	if t.done {
+		return nil, ErrTxnClosed
+	}
+	snap, err := t.Snapshot()
+	if err != nil {
+		return nil, err
+	}
+	p, err := t.PlanScan(snap, ScanRequest{Table: q.table, Conds: q.conds, Need: q.neededColumns()})
+	if err != nil {
+		return nil, err
+	}
+	for _, j := range q.joins {
+		if !j.right.isPlainScan() {
+			return nil, fmt.Errorf("%w: the right side of a join must be Scan(table).Where(...)", ErrBadQuery)
+		}
+		r, err := t.PlanScan(snap, ScanRequest{Table: j.right.table, Conds: j.right.conds})
+		if err != nil {
+			return nil, err
+		}
+		if p, err = PlanJoin(p, r, j.typ, j.leftCol, j.rightCol); err != nil {
+			return nil, err
+		}
+	}
+	if len(q.groupBy) > 0 || len(q.aggs) > 0 {
+		var groupCols []int
+		var cols []string
+		for _, g := range q.groupBy {
+			i, err := resolve(p.Cols, g)
+			if err != nil {
+				return nil, err
+			}
+			groupCols = append(groupCols, i)
+			cols = append(cols, p.Cols[i])
+		}
+		var specs []sortagg.AggSpec
+		for _, a := range q.aggs {
+			spec := sortagg.AggSpec{Func: a.Func}
+			if a.Func != sortagg.AggCountStar {
+				i, err := resolve(p.Cols, a.Col)
+				if err != nil {
+					return nil, err
+				}
+				spec.Col = i
+			}
+			specs = append(specs, spec)
+			cols = append(cols, a.Name())
+		}
+		node := &PlanNode{Name: "Aggregate", Children: []*PlanNode{p.Node}}
+		if len(groupCols) > 0 {
+			node.Name = "HashAggregate"
+			node.Details = []string{"Group Key: " + strings.Join(cols[:len(groupCols)], ", ")}
+		}
+		child := p.Iter
+		it := &materialized{run: func() ([]types.Row, error) { return sortagg.HashAggregate(child, groupCols, specs, nil) }}
+		p = &Plan{Iter: it, Cols: cols, Node: node}
+	}
+	if len(q.orderBy) > 0 {
+		var keys []sortagg.SortKey
+		var names []string
+		for _, o := range q.orderBy {
+			i, err := resolve(p.Cols, o.Col)
+			if err != nil {
+				return nil, err
+			}
+			keys = append(keys, sortagg.Key(i, o.Desc))
+			n := p.Cols[i]
+			if o.Desc {
+				n += " DESC"
+			}
+			names = append(names, n)
+		}
+		node := &PlanNode{Name: "Sort", Details: []string{"Sort Key: " + strings.Join(names, ", ")}, Children: []*PlanNode{p.Node}}
+		var it exec.Iterator
+		if q.limit >= 0 {
+			it = sortagg.NewTopN(p.Iter, q.limit+q.offset, keys...)
+			node.Details = append(node.Details, "Sort Method: top-N heapsort")
+		} else {
+			it = sortagg.NewSort(p.Iter, keys...)
+		}
+		p = &Plan{Iter: it, Cols: p.Cols, Node: node}
+	}
+	if q.limit >= 0 || q.offset > 0 {
+		p = &Plan{
+			Iter: &executor.Limit{Child: p.Iter, Count: q.limit, Offset: q.offset},
+			Cols: p.Cols,
+			Node: &PlanNode{Name: "Limit", Children: []*PlanNode{p.Node}},
+		}
+	}
+	if len(q.selectCols) > 0 {
+		var exprs []executor.Expr
+		var cols []string
+		for _, s := range q.selectCols {
+			i, err := resolve(p.Cols, s)
+			if err != nil {
+				return nil, err
+			}
+			exprs = append(exprs, executor.Col(i, p.Cols[i]))
+			cols = append(cols, p.Cols[i])
+		}
+		p = &Plan{Iter: &executor.Project{Child: p.Iter, Exprs: exprs}, Cols: cols, Node: p.Node}
+	}
+	return p, nil
 }

@@ -37,5 +37,18 @@ import "github.com/natthphong/daTarbase/pkg/types"
 // Constraints: O(len(log) - from).
 // Postgres reference: XLogReadRecord() / XLogDecodeNextRecord() in src/backend/access/transam/xlogreader.c
 func ReadRecords(log []byte, from types.LSN) ([]Record, types.LSN, error) {
-	panic("TODO: Problem 10.4")
+	if from < FirstLSN || int(from) > len(log) {
+		return nil, 0, ErrInvalidLSN
+	}
+	var out []Record
+	pos := from
+	for int(pos) < len(log) {
+		r, n, err := DecodeRecord(log[pos:])
+		if err != nil || r.LSN != pos {
+			break
+		}
+		out = append(out, r)
+		pos += types.LSN(n)
+	}
+	return out, pos, nil
 }

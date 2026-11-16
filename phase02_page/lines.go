@@ -1,5 +1,7 @@
 package page
 
+import "encoding/binary"
+
 // Problem 2.1 — SetItemID [Easy]
 //
 // Encode a line pointer and write it into an existing slot of the line-pointer array.
@@ -36,7 +38,16 @@ package page
 // Constraints: O(1), no allocation.
 // Postgres reference: ItemIdSetNormal / ItemIdSetDead in src/include/storage/itemid.h
 func (p *Page) SetItemID(slot SlotID, it ItemID) error {
-	panic("TODO: Problem 2.1")
+	if int(slot) >= p.NumSlots() {
+		return ErrInvalidSlot
+	}
+	if it.Flags > 3 || it.Len > MaxItemLen {
+		return ErrBadItemID
+	}
+	at := HeaderSize + int(slot)*LinePointerLen
+	binary.LittleEndian.PutUint16(p.buf[at:], it.Off)
+	binary.LittleEndian.PutUint16(p.buf[at+2:], uint16(it.Flags)<<14|it.Len)
+	return nil
 }
 
 // Problem 2.2 — ItemID [Easy]
@@ -61,7 +72,16 @@ func (p *Page) SetItemID(slot SlotID, it ItemID) error {
 // Constraints: O(1), no allocation.
 // Postgres reference: PageGetItemId, ItemIdGetOffset/Flags/Length in src/include/storage/itemid.h
 func (p *Page) ItemID(slot SlotID) (ItemID, error) {
-	panic("TODO: Problem 2.2")
+	if int(slot) >= p.NumSlots() {
+		return ItemID{}, ErrInvalidSlot
+	}
+	at := HeaderSize + int(slot)*LinePointerLen
+	word := binary.LittleEndian.Uint16(p.buf[at+2:])
+	return ItemID{
+		Off:   binary.LittleEndian.Uint16(p.buf[at:]),
+		Flags: LPFlags(word >> 14),
+		Len:   word & MaxItemLen,
+	}, nil
 }
 
 // Problem 2.3 — FreeSpace [Easy]
@@ -93,5 +113,16 @@ func (p *Page) ItemID(slot SlotID) (ItemID, error) {
 // Constraints: O(NumSlots()), no allocation.
 // Postgres reference: PageGetFreeSpace / PageGetHeapFreeSpace in src/backend/storage/page/bufpage.c
 func (p *Page) FreeSpace() int {
-	panic("TODO: Problem 2.3")
+	free := int(p.Upper()) - int(p.Lower())
+	reusable := false
+	for s := 0; s < p.NumSlots(); s++ {
+		if it, _ := p.ItemID(SlotID(s)); it.Flags == LPUnused {
+			reusable = true
+			break
+		}
+	}
+	if !reusable {
+		free -= LinePointerLen
+	}
+	return max(free, 0)
 }

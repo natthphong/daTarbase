@@ -61,7 +61,53 @@ import (
 // Constraints: O(|outer|·|inner|) time, O(1) extra memory besides the output.
 // Postgres reference: ExecNestLoop() in src/backend/executor/nodeNestloop.c
 func NestedLoopInner(outer, inner exec.Iterator, spec JoinSpec) ([]types.Row, error) {
-	panic("TODO: Problem 8.2")
+	if spec.Type != Inner {
+		return nil, ErrUnsupportedJoin
+	}
+	if err := outer.Open(); err != nil {
+		return nil, err
+	}
+	var out []types.Row
+	for {
+		o, ok, err := outer.Next()
+		if err != nil {
+			outer.Close()
+			return nil, err
+		}
+		if !ok {
+			break
+		}
+		if err := inner.Open(); err != nil {
+			outer.Close()
+			return nil, err
+		}
+		for {
+			in, ok, err := inner.Next()
+			if err == nil && ok {
+				var m bool
+				m, err = spec.Match(o, in)
+				if m {
+					out = append(out, Concat(o, in))
+				}
+			}
+			if err != nil {
+				inner.Close()
+				outer.Close()
+				return nil, err
+			}
+			if !ok {
+				break
+			}
+		}
+		if err := inner.Close(); err != nil {
+			outer.Close()
+			return nil, err
+		}
+	}
+	if err := outer.Close(); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // Problem 8.3 — NestedLoopLeft [Medium]
@@ -101,7 +147,57 @@ func NestedLoopInner(outer, inner exec.Iterator, spec JoinSpec) ([]types.Row, er
 // Constraints: O(|outer|·|inner|) time.
 // Postgres reference: ExecNestLoop() (JOIN_LEFT, nl_MatchedOuter) in src/backend/executor/nodeNestloop.c
 func NestedLoopLeft(outer, inner exec.Iterator, spec JoinSpec) ([]types.Row, error) {
-	panic("TODO: Problem 8.3")
+	if spec.Type != Left {
+		return nil, ErrUnsupportedJoin
+	}
+	if err := outer.Open(); err != nil {
+		return nil, err
+	}
+	fail := func(err error) ([]types.Row, error) {
+		outer.Close()
+		return nil, err
+	}
+	var out []types.Row
+	for {
+		o, ok, err := outer.Next()
+		if err != nil {
+			return fail(err)
+		}
+		if !ok {
+			break
+		}
+		if err := inner.Open(); err != nil {
+			return fail(err)
+		}
+		matched := false
+		for {
+			in, ok, err := inner.Next()
+			if err == nil && ok {
+				var m bool
+				if m, err = spec.Match(o, in); m {
+					matched = true
+					out = append(out, Concat(o, in))
+				}
+			}
+			if err != nil {
+				inner.Close()
+				return fail(err)
+			}
+			if !ok {
+				break
+			}
+		}
+		if err := inner.Close(); err != nil {
+			return fail(err)
+		}
+		if !matched {
+			out = append(out, Concat(o, NullRow(spec.RightWidth)))
+		}
+	}
+	if err := outer.Close(); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // Problem 8.4 — NestedLoopRightFull [Medium]
@@ -146,7 +242,90 @@ func NestedLoopLeft(outer, inner exec.Iterator, spec JoinSpec) ([]types.Row, err
 // Constraints: O(|outer|·|inner|) time, O(|inner|) memory for the flags.
 // Postgres reference: match_unsorted_outer() in src/backend/optimizer/path/joinpath.c (no nestloop for RIGHT/FULL)
 func NestedLoopRightFull(outer, inner exec.Iterator, spec JoinSpec) ([]types.Row, error) {
-	panic("TODO: Problem 8.4")
+	if spec.Type != Right && spec.Type != Full {
+		return nil, ErrUnsupportedJoin
+	}
+	if err := outer.Open(); err != nil {
+		return nil, err
+	}
+	fail := func(err error) ([]types.Row, error) {
+		outer.Close()
+		return nil, err
+	}
+	var (
+		out        []types.Row
+		innerRows  []types.Row // inner rows, remembered during the first scan
+		matched    []bool      // matched[i]: innerRows[i] matched some outer row
+		firstScan  = true
+		sawOuter   = false
+		outerMatch bool // the current outer row matched something
+	)
+	// scanInner rescans the inner for outer row o (o == nil: just read it).
+	scanInner := func(o types.Row) error {
+		if err := inner.Open(); err != nil {
+			return err
+		}
+		for pos := 0; ; pos++ {
+			in, ok, err := inner.Next()
+			if err != nil {
+				inner.Close()
+				return err
+			}
+			if !ok {
+				break
+			}
+			if firstScan {
+				innerRows = append(innerRows, in)
+				matched = append(matched, false)
+			}
+			if o == nil {
+				continue
+			}
+			m, err := spec.Match(o, in)
+			if err != nil {
+				inner.Close()
+				return err
+			}
+			if m {
+				outerMatch = true
+				matched[pos] = true
+				out = append(out, Concat(o, in))
+			}
+		}
+		firstScan = false
+		return inner.Close()
+	}
+	for {
+		o, ok, err := outer.Next()
+		if err != nil {
+			return fail(err)
+		}
+		if !ok {
+			break
+		}
+		sawOuter = true
+		outerMatch = false
+		if err := scanInner(o); err != nil {
+			return fail(err)
+		}
+		if spec.Type == Full && !outerMatch {
+			out = append(out, Concat(o, NullRow(spec.RightWidth)))
+		}
+	}
+	if !sawOuter {
+		if err := scanInner(nil); err != nil {
+			return fail(err)
+		}
+	}
+	for i, in := range innerRows {
+		if !matched[i] {
+			out = append(out, Concat(NullRow(spec.LeftWidth), in))
+		}
+	}
+	if err := outer.Close(); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // Problem 8.5 — NestedLoopSemiAnti [Medium]
@@ -181,7 +360,53 @@ func NestedLoopRightFull(outer, inner exec.Iterator, spec JoinSpec) ([]types.Row
 // Constraints: stop each inner scan at the first match.
 // Postgres reference: ExecNestLoop() (node->js.single_match, JOIN_SEMI/JOIN_ANTI) in src/backend/executor/nodeNestloop.c
 func NestedLoopSemiAnti(outer, inner exec.Iterator, spec JoinSpec) ([]types.Row, error) {
-	panic("TODO: Problem 8.5")
+	if spec.Type != Semi && spec.Type != Anti {
+		return nil, ErrUnsupportedJoin
+	}
+	if err := outer.Open(); err != nil {
+		return nil, err
+	}
+	fail := func(err error) ([]types.Row, error) {
+		outer.Close()
+		return nil, err
+	}
+	var out []types.Row
+	for {
+		o, ok, err := outer.Next()
+		if err != nil {
+			return fail(err)
+		}
+		if !ok {
+			break
+		}
+		if err := inner.Open(); err != nil {
+			return fail(err)
+		}
+		found := false
+		for !found {
+			in, ok, err := inner.Next()
+			if err == nil && ok {
+				found, err = spec.Match(o, in)
+			}
+			if err != nil {
+				inner.Close()
+				return fail(err)
+			}
+			if !ok {
+				break
+			}
+		}
+		if err := inner.Close(); err != nil {
+			return fail(err)
+		}
+		if found == (spec.Type == Semi) {
+			out = append(out, o)
+		}
+	}
+	if err := outer.Close(); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // Problem 8.6 — NotIn [Medium]
@@ -227,5 +452,54 @@ func NestedLoopSemiAnti(outer, inner exec.Iterator, spec JoinSpec) ([]types.Row,
 // Constraints: O(|outer| + |inner|) expected time; the inner is read once.
 // Postgres reference: ExecHashSubPlan() in src/backend/executor/nodeSubplan.c
 func NotIn(outer, inner exec.Iterator, outerCol, innerCol int) ([]types.Row, error) {
-	panic("TODO: Problem 8.6")
+	if err := inner.Open(); err != nil {
+		return nil, err
+	}
+	set := map[string]bool{}
+	innerRows, sawNull := 0, false
+	for {
+		r, ok, err := inner.Next()
+		if err != nil {
+			inner.Close()
+			return nil, err
+		}
+		if !ok {
+			break
+		}
+		innerRows++
+		if v := r[innerCol]; v.IsNull() {
+			sawNull = true
+		} else {
+			set[v.HashKey()] = true
+		}
+	}
+	if err := inner.Close(); err != nil {
+		return nil, err
+	}
+	if err := outer.Open(); err != nil {
+		return nil, err
+	}
+	var out []types.Row
+	for {
+		r, ok, err := outer.Next()
+		if err != nil {
+			outer.Close()
+			return nil, err
+		}
+		if !ok {
+			break
+		}
+		v := r[outerCol]
+		switch {
+		case innerRows == 0:
+			out = append(out, r)
+		case v.IsNull(), set[v.HashKey()], sawNull:
+		default:
+			out = append(out, r)
+		}
+	}
+	if err := outer.Close(); err != nil {
+		return nil, err
+	}
+	return out, nil
 }

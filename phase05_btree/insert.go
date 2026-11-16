@@ -1,6 +1,8 @@
 package btree
 
 import (
+	"slices"
+
 	"github.com/natthphong/daTarbase/pkg/types"
 )
 
@@ -30,7 +32,15 @@ import (
 // Constraints: O(log n) search + O(n) shift.
 // Postgres reference: _bt_insertonpg() / PageAddItem() in src/backend/access/nbtree/nbtinsert.c
 func (n *Node) InsertItem(it Item, limit int) (int, error) {
-	panic("TODO: Problem 5.6")
+	pos := n.LowerBound(it)
+	if pos < len(n.Items) && CompareItems(n.Items[pos], it) == 0 {
+		return -1, ErrDuplicateEntry
+	}
+	if len(n.Items) >= limit {
+		return -1, ErrNodeFull
+	}
+	n.Items = slices.Insert(n.Items, pos, it)
+	return pos, nil
 }
 
 // Problem 5.7 — SplitLeaf [Hard]
@@ -65,7 +75,23 @@ func (n *Node) InsertItem(it Item, limit int) (int, error) {
 // Postgres reference: _bt_split() in src/backend/access/nbtree/nbtinsert.c
 // (split point chosen by _bt_findsplitloc() in nbtsplitloc.c).
 func (t *Tree) SplitLeaf(left *Node) (*Node, Item) {
-	panic("TODO: Problem 5.7")
+	k := (len(left.Items) + 1) / 2
+	right := t.Store.Alloc(true)
+	right.Items = append([]Item(nil), left.Items[k:]...)
+	left.Items = slices.Clip(left.Items[:k])
+
+	right.Prev = left.ID
+	right.Next = left.Next
+	left.Next = right.ID
+	if right.Next != types.InvalidPageID {
+		nx := t.Store.Get(right.Next)
+		nx.Prev = right.ID
+		t.Store.Put(nx)
+	}
+	t.Store.Put(left)
+	t.Store.Put(right)
+	first := right.Items[0]
+	return right, Item{Key: first.Key, TID: first.TID}
 }
 
 // Problem 5.8 — SplitInternal [Hard]
@@ -99,7 +125,16 @@ func (t *Tree) SplitLeaf(left *Node) (*Node, Item) {
 // Postgres reference: _bt_split() in src/backend/access/nbtree/nbtinsert.c
 // (on internal pages the "first data key" of the right page becomes its minus-infinity item).
 func (t *Tree) SplitInternal(left *Node) (*Node, Item) {
-	panic("TODO: Problem 5.8")
+	m := len(left.Items) / 2
+	sep := left.Items[m]
+	right := t.Store.Alloc(false)
+	right.Items = append([]Item(nil), left.Items[m+1:]...)
+	right.Children = append([]types.PageID(nil), left.Children[m+1:]...)
+	left.Items = slices.Clip(left.Items[:m])
+	left.Children = slices.Clip(left.Children[:m+1])
+	t.Store.Put(left)
+	t.Store.Put(right)
+	return right, sep
 }
 
 // Problem 5.9 — GrowRoot [Easy]
@@ -123,7 +158,12 @@ func (t *Tree) SplitInternal(left *Node) (*Node, Item) {
 // Constraints: 1 alloc, 1 write.
 // Postgres reference: _bt_newlevel() in src/backend/access/nbtree/nbtinsert.c
 func (t *Tree) GrowRoot(sep Item, right types.PageID) {
-	panic("TODO: Problem 5.9")
+	root := t.Store.Alloc(false)
+	root.Items = []Item{sep}
+	root.Children = []types.PageID{t.Root, right}
+	t.Store.Put(root)
+	t.Root = root.ID
+	t.Height++
 }
 
 // Problem 5.10 — Insert [Hard]
@@ -160,7 +200,30 @@ func (t *Tree) GrowRoot(sep Item, right types.PageID) {
 // Constraints: Height reads (+1 per leaf split whose left had a Next).
 // Postgres reference: _bt_doinsert() / _bt_insert_parent() in src/backend/access/nbtree/nbtinsert.c
 func (t *Tree) Insert(it Item) error {
-	panic("TODO: Problem 5.10")
+	path := t.Descend(it)
+	leaf := path[len(path)-1].Node
+	if _, err := leaf.InsertItem(it, t.MaxItems+1); err != nil {
+		return err
+	}
+	if len(leaf.Items) <= t.MaxItems {
+		t.Store.Put(leaf)
+		return nil
+	}
+	right, sep := t.SplitLeaf(leaf)
+	rightID := right.ID
+	for lvl := len(path) - 2; lvl >= 0; lvl-- {
+		p, i := path[lvl].Node, path[lvl].Pos
+		p.Items = slices.Insert(p.Items, i, sep)
+		p.Children = slices.Insert(p.Children, i+1, rightID)
+		if len(p.Items) <= t.MaxItems {
+			t.Store.Put(p)
+			return nil
+		}
+		r, s := t.SplitInternal(p)
+		rightID, sep = r.ID, s
+	}
+	t.GrowRoot(sep, rightID)
+	return nil
 }
 
 // Problem 5.11 — InsertUnique [Easy]
@@ -186,5 +249,8 @@ func (t *Tree) Insert(it Item) error {
 // Constraints: O(log n) reads for the check.
 // Postgres reference: _bt_check_unique() in src/backend/access/nbtree/nbtinsert.c
 func (t *Tree) InsertUnique(it Item) error {
-	panic("TODO: Problem 5.11")
+	if len(t.Search(it.Key)) > 0 {
+		return ErrDuplicateKey
+	}
+	return t.Insert(it)
 }

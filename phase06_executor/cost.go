@@ -1,5 +1,9 @@
 package executor
 
+import (
+	"math"
+)
+
 // Planner cost constants, Postgres defaults (postgresql.conf).
 const (
 	SeqPageCost       = 1.0    // seq_page_cost: one sequentially-read page
@@ -89,5 +93,42 @@ type ScanChoice struct {
 // Postgres reference: cost_seqscan(), cost_index(), cost_bitmap_heap_scan(), index_pages_fetched()
 // in src/backend/optimizer/path/costsize.c; genericcostestimate() in selfuncs.c
 func ChooseScan(in ScanCostInput) ScanChoice {
-	panic("TODO: Problem 6.14")
+	P, N, s := in.RelPages, in.RelTuples, in.Selectivity
+	seq := P*SeqPageCost + N*(CPUTupleCost+CPUOperatorCost)
+	out := ScanChoice{Path: PathSeqScan, Cost: seq, SeqCost: seq, IndexCost: math.Inf(1), BitmapCost: math.Inf(1)}
+	if !in.HasIndex {
+		return out
+	}
+	T := s * N
+	indexPart := math.Ceil(s*in.IndexPages)*RandomPageCost + T*(CPUIndexTupleCost+CPUOperatorCost)
+	pages := 0.0
+	if T > 0 {
+		pages = 2 * P * T / (2*P + T)
+		if pages >= P {
+			pages = P
+		} else {
+			pages = math.Ceil(pages)
+		}
+	}
+	maxIO := pages * RandomPageCost
+	minIO := 0.0
+	if k := math.Ceil(s * P); k > 0 {
+		minIO = RandomPageCost + (k-1)*SeqPageCost
+	}
+	io := maxIO + in.Correlation*in.Correlation*(minIO-maxIO)
+	out.IndexCost = indexPart + io + T*CPUTupleCost
+
+	costPerPage := RandomPageCost
+	if pages >= 2 {
+		costPerPage = RandomPageCost - (RandomPageCost-SeqPageCost)*math.Sqrt(pages/P)
+	}
+	out.BitmapCost = indexPart + pages*costPerPage + T*(CPUTupleCost+CPUOperatorCost)
+
+	if out.IndexCost < out.Cost {
+		out.Path, out.Cost = PathIndexScan, out.IndexCost
+	}
+	if out.BitmapCost < out.Cost {
+		out.Path, out.Cost = PathBitmapScan, out.BitmapCost
+	}
+	return out
 }
